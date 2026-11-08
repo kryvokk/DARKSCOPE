@@ -2,7 +2,9 @@ package http
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -44,29 +46,36 @@ func isHoneypotEndpoint(path string) bool {
 // Collector реализует HTTP Honeypot.
 type Collector struct {
 	protocols.BaseCollector
-	cfg     *config.HTTPConfig
-	server  *http.Server
+	cfg      *config.HTTPConfig
+	server   *http.Server
 	listener net.Listener
-	log     *slog.Logger
+	log      *slog.Logger
+	publisher protocols.Publisher
 }
 
 // New создаёт новый HTTP Collectор.
-func New(cfg *config.HTTPConfig, eventBus *event.EventBus, sessMgr *session.Manager, log *slog.Logger) (*Collector, error) {
+func New(cfg *config.HTTPConfig, publisher protocols.Publisher, sessMgr *session.Manager, log *slog.Logger) (*Collector, error) {
 	mux := http.NewServeMux()
 	h := &handler{}
 
 	c := &Collector{
-		cfg:  cfg,
-		log:  log,
+		BaseCollector: protocols.BaseCollector{Sessions: sessMgr},
+		cfg:           cfg,
+		log:           log,
+		publisher:     publisher,
 	}
 
 	h.collector = c
 
-	// Регистрируем обработчики для всех эндпоинтов.
+	// Регистрируем обработчики для типовых honeypot-эндпоинтов.
+	// "/" регистрируется отдельно один раз как catch-all: повторная
+	// регистрация одного и того же пути вызывает панику ServeMux.
 	for _, ep := range honeypotEndpoints {
+		if ep == "/" {
+			continue
+		}
 		mux.HandleFunc(ep, h.handleRequest)
 	}
-	// Обработчик для всех остальных путей (перехватывает всё остальное).
 	mux.HandleFunc("/", h.handleRequest)
 
 	server := &http.Server{
@@ -81,6 +90,12 @@ func New(cfg *config.HTTPConfig, eventBus *event.EventBus, sessMgr *session.Mana
 
 	return c, nil
 }
+
+// Name возвращает имя протокола.
+func (c *Collector) Name() string { return "http" }
+
+// ListenAddr возвращает адрес прослушивания.
+func (c *Collector) ListenAddr() string { return c.cfg.ListenAddress }
 
 // handler обрабатывает HTTP-запросы.
 type handler struct {
@@ -97,8 +112,11 @@ func (h *handler) handleRequest(w http.ResponseWriter, r *http.Request) {
 	remoteAddr := r.RemoteAddr
 	host, port, _ := net.SplitHostPort(remoteAddr)
 
-	// Создаём сессию для этого запроса.
-	sessionID := fmt.Sprintf("%x", sha256.Sum256([]byte(remoteAddr+r.URL.Path+r.Method)))
+	// Уникальный ID на каждый запрос. В этом коммите гарантируется
+	// уникальность, чтобы повторный запрос не конфликтовал с уже
+	// существующей сессией; полноценная сессия "на соединение"
+	// вводится следующим коммитом.
+	sessionID := newSessionID()
 
 	_, err := c.BaseCollector.Sessions.CreateSession(
 		sessionID, host, "http", mustAtoi(port),
@@ -123,12 +141,14 @@ func (h *handler) handleRequest(w http.ResponseWriter, r *http.Request) {
 		"is_honeypot_endpoint": isHoneypotEndpoint(r.URL.Path),
 	}
 
-	// Читаем тело запроса с ограничением размера.
-	body := io.LimitReader(r.Body, c.cfg.MaxBodySize)
-	bodyData, err := io.ReadAll(body)
+	// Читаем тело запроса с жёстким ограничением размера.
+	// MaxBytesReader гарантирует, что клиент не сможет передать
+	// больше лимита и что место под тело не будет выделено заранее.
+	r.Body = http.MaxBytesReader(w, r.Body, c.cfg.MaxBodySize)
+	bodyData, err := io.ReadAll(r.Body)
 	if err != nil {
 		c.log.Warn("http read body failed", "session_id", sessionID, "error", err)
-		http.Error(w, "bad request", http.StatusBadRequest)
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -184,6 +204,20 @@ func headersToMap(h http.Header) map[string]string {
 		}
 	}
 	return m
+}
+
+// sessionIDSeq — резерв для генерации ID при недоступном crypto/rand.
+var sessionIDSeq atomic.Uint64
+
+// newSessionID генерирует уникальный идентификатор сессии/запроса на основе
+// crypto/rand; при недоступном rand использует резервный счётчик.
+func newSessionID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		n := sessionIDSeq.Add(1)
+		binary.BigEndian.PutUint64(b[:], n)
+	}
+	return fmt.Sprintf("http-%s", hex.EncodeToString(b[:]))
 }
 
 // Start запускает HTTP сервер.
@@ -268,7 +302,7 @@ func mustAtoi(s string) int {
 func (c *Collector) publishEvent(sessionID, sourceIP, sourcePort, protocol, service string, et event.EventType, payload interface{}, severity event.Severity) {
 	ev := event.NewEvent(sessionID, sourceIP, "127.0.0.1", mustAtoi(sourcePort), 80, protocol, service, et, payload)
 	ev.WithSeverity(severity).WithConfidence(0.9)
-	if err := c.BaseCollector.EventBus.Publish(ev); err != nil {
+	if err := c.publisher.Publish(ev); err != nil {
 		c.log.Warn("http publish event failed", "error", err)
 	}
 }

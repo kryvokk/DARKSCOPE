@@ -124,3 +124,8 @@ var _ = CollectorConfig{}
 var _ = session.Session{}
 var _ = event.Event{}
 var _ = time.Second
+
+// Publisher — интерфейс для публикации событий.
+type Publisher interface {
+	Publish(ev *event.Event) error
+}

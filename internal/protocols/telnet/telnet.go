@@ -25,15 +25,24 @@ type Collector struct {
 	cfg     *config.TelnetConfig
 	listener net.Listener
 	log     *slog.Logger
+	publisher protocols.Publisher
 }
 
 // New создаёт новый Telnet Collectор.
-func New(cfg *config.TelnetConfig, eventBus *event.EventBus, sessMgr *session.Manager, log *slog.Logger) (*Collector, error) {
+func New(cfg *config.TelnetConfig, eventBus protocols.Publisher, sessMgr *session.Manager, log *slog.Logger) (*Collector, error) {
 	return &Collector{
-		cfg:  cfg,
-		log:  log,
+		BaseCollector: protocols.BaseCollector{Sessions: sessMgr},
+		cfg:           cfg,
+		log:           log,
+		publisher:     eventBus,
 	}, nil
 }
+
+// Name возвращает имя протокола.
+func (c *Collector) Name() string { return "telnet" }
+
+// ListenAddr возвращает адрес прослушивания.
+func (c *Collector) ListenAddr() string { return c.cfg.ListenAddress }
 
 // Start запускает Telnet слушатель.
 func (c *Collector) Start(ctx context.Context) error {
@@ -88,6 +97,7 @@ func (c *Collector) acceptLoop() {
 
 // handleConn обрабатывает одно Telnet-подключение.
 func (c *Collector) handleConn(conn net.Conn) {
+	defer c.BaseCollector.GetWG().Done()
 	defer c.BaseCollector.ReleaseConn()
 	defer conn.Close()
 
@@ -281,7 +291,7 @@ func mustAtoi(s string) int {
 func (c *Collector) publishEvent(sessionID, sourceIP, sourcePort, protocol, service string, et event.EventType, payload interface{}, severity event.Severity) {
 	ev := event.NewEvent(sessionID, sourceIP, "127.0.0.1", mustAtoi(sourcePort), 23, protocol, service, et, payload)
 	ev.WithSeverity(severity).WithConfidence(0.9)
-	if err := c.BaseCollector.EventBus.Publish(ev); err != nil {
+	if err := c.publisher.Publish(ev); err != nil {
 		c.log.Warn("telnet publish event failed", "error", err)
 	}
 }

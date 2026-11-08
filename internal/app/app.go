@@ -118,12 +118,13 @@ func (a *App) Run(ctx context.Context) error {
 	a.log.Info("event bus started")
 
 	// Запускаем все включённые сборщики протоколов.
-	for _, coll := range a.collectors {
+	// Индексный цикл: при неуспехе старта откатываем только уже
+	// запущенные (collectors[:i]), не затрагивая несостоявшийся.
+	for i, coll := range a.collectors {
 		if err := coll.Start(ctx); err != nil {
 			a.log.Error("collector start failed", "collector", coll.Name(), "error", err)
-			// Останавливаем уже запущенные сборщики.
-			for _, stopped := range a.collectors[:len(a.collectors)-1] {
-				_ = stopped.Stop(context.Background())
+			for _, started := range a.collectors[:i] {
+				_ = started.Stop(context.Background())
 			}
 			return fmt.Errorf("start collector %s: %w", coll.Name(), err)
 		}
