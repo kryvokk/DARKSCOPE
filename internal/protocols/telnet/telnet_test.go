@@ -3,6 +3,7 @@ package telnet
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -109,5 +110,58 @@ func TestTelnetCapturesCredentialsWithoutShellAndStopsActiveConn(t *testing.T) {
 		if e.EventType == event.EventTypeCommand {
 			t.Fatal("Telnet must not publish or execute commands")
 		}
+	}
+}
+
+func TestTelnetInteractiveShellHoneytoken(t *testing.T) {
+	rc := &recorder{}
+	c, err := New(&config.TelnetConfig{ListenAddress: "127.0.0.1:0", LoginTimeout: 5 * time.Second, ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second}, rc, session.NewManager(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop(context.Background())
+	conn, err := net.Dial("tcp", c.ListenAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	r := bufio.NewReader(conn)
+	_, _ = r.ReadString(':')
+	for i := 0; i < 3; i++ {
+		_, _ = io.WriteString(conn, fmt.Sprintf("user%d\r\n", i))
+		_, err = r.ReadString(':')
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(conn, "fakepass\r\n")
+		if i < 2 {
+			_, err = r.ReadString(':')
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	_, _ = r.ReadString('$')
+	_, _ = io.WriteString(conn, "cat /etc/shadow\r\n")
+	var output strings.Builder
+	for !strings.Contains(output.String(), "not-a-real-hash") {
+		line, e := r.ReadString('\n')
+		if e != nil {
+			t.Fatalf("shell output %q: %v", output.String(), e)
+		}
+		output.WriteString(line)
+	}
+	found := false
+	for _, ev := range rc.snapshot() {
+		if ev.EventType == event.EventTypeHoneytokenAccess {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing honeytoken event")
 	}
 }

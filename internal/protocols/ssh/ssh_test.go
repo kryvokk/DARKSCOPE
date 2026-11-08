@@ -324,6 +324,64 @@ func TestSSHAuthCapture(t *testing.T) {
 	}
 }
 
+func TestSSHVirtualShellHoneytoken(t *testing.T) {
+	capture := &captureProcessor{}
+	cfg := &config.SSHConfig{ListenAddress: "127.0.0.1:0", AuthTimeout: 5 * time.Second, MaxConnections: 4}
+	c, err := New(cfg, capture, session.NewManager(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err = c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop(context.Background())
+	conn, err := net.Dial("tcp", c.ListenAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConn, chans, reqs, err := ssh.NewClientConn(conn, c.ListenAddr(), &ssh.ClientConfig{User: "u", Auth: []ssh.AuthMethod{ssh.Password("p")}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 3 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := ssh.NewClient(clientConn, chans, reqs)
+	defer client.Close()
+	ch, in, err := client.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go ssh.DiscardRequests(in)
+	_, err = ch.SendRequest("shell", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = ch.Write([]byte("cat /etc/shadow\r"))
+	buf := make([]byte, 4096)
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var output strings.Builder
+	for !strings.Contains(output.String(), "not-a-real-hash") {
+		n, readErr := ch.Read(buf)
+		if readErr != nil {
+			t.Fatalf("shell output %q: %v", output.String(), readErr)
+		}
+		output.Write(buf[:n])
+	}
+	if !strings.Contains(output.String(), "not-a-real-hash") {
+		t.Fatalf("unexpected shell output %q", output.String())
+	}
+	ch.Close()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		for _, e := range capture.Events() {
+			if e.EventType == event.EventTypeHoneytokenAccess {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("missing honeytoken event")
+}
+
 // TestSSHStopClosesActiveConnections проверяет, что Stop завершает
 // соединение с активным SSH-сеансом за ограниченное время.
 func TestSSHStopClosesActiveConnections(t *testing.T) {

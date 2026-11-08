@@ -148,6 +148,24 @@ Storage, Detection, Alert. Медленный подписчик не блоки
 анализа попыток; настоящая проверка учётных данных и интерактивная эмуляция
 среды в Phase 2 отсутствуют.
 
+## Виртуальная оболочка (Phase 3)
+
+После honeypot-аутентификации SSH и Telnet предоставляют изолированную
+виртуальную среду с отдельной файловой системой на сеанс. Команды проходят
+через собственный parser и registry. Реализованы `pwd`, `cd`, `ls`, `tree`,
+`cat`, `head`, `tail`, `touch`, `mkdir`, `rm`, `cp`, `mv`, `find`, `file`,
+`stat`, `whoami`, `id`, `hostname`, `uname`, `date`, `env`, `history`, `ps`,
+`top`, `df`, `free`, `mount`, `ip`, `ifconfig`, `ping`, `netstat`, `ss`,
+`curl`, `wget`, `ssh`, `scp`, `help`, `man`, `echo`, `printf`, `grep`, `wc`,
+`sort`, `uniq`, `which`. Сетевые команды возвращают симулированный результат.
+Parser запрещает shell-операторы и command substitution; команды не запускают
+процессы хоста.
+
+Honeytoken-файлы содержат фиктивные значения. Их чтение создаёт
+`honeytoken_access` event с session ID, путём и командой; Event Bus передаёт
+событие в SQLite. Лимиты на сессию: команда 4 KiB, вывод 64 KiB, история 1000
+строк, VFS 4096 узлов и 16 MiB данных.
+
 ## Безопасность
 
 - Нет реального shell, нет `os/exec`, нет доступа к файловой системы
