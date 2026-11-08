@@ -520,6 +520,22 @@ func TestHTTPHeaderCap(t *testing.T) {
 	}
 }
 
+func TestHTTPHeaderCapCountsDuplicateFields(t *testing.T) {
+	coll, _, _ := newTestCollector(t, func(cfg *config.HTTPConfig) { cfg.MaxHeaders = 4 })
+	startAndRegister(t, coll)
+	conn, err := net.DialTimeout("tcp", actualAddr(coll), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, _ = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: darkscope\r\nX-Probe: 1\r\nX-Probe: 2\r\nX-Probe: 3\r\nX-Probe: 4\r\nX-Probe: 5\r\n\r\n")
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || !strings.Contains(line, "431") {
+		t.Fatalf("response line = %q, err = %v; want 431", line, err)
+	}
+}
+
 // TestHTTPNoBodyNoCrash проверяет отсутствие body_*-полей у запросов без
 // тела и ответ honeypot с заголовком Server.
 func TestHTTPNoBodyNoCrash(t *testing.T) {

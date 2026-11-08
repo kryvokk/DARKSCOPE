@@ -253,10 +253,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	host, port, _ := net.SplitHostPort(r.RemoteAddr)
-	if len(r.Header) > c.cfg.MaxHeaders {
+	headerCount := 0
+	for _, values := range r.Header {
+		headerCount += len(values)
+	}
+	if headerCount > c.cfg.MaxHeaders {
 		_ = c.BaseCollector.Sessions.RecordEvent(sessionID)
 		c.publishEvent(sessionID, host, port, "http", "http", event.EventTypeProtocolError,
-			map[string]interface{}{"reason": "too_many_headers", "count": len(r.Header), "limit": c.cfg.MaxHeaders}, event.SeverityMedium)
+			map[string]interface{}{"reason": "too_many_headers", "count": headerCount, "limit": c.cfg.MaxHeaders}, event.SeverityMedium)
 		http.Error(w, "too many headers", http.StatusRequestHeaderFieldsTooLarge)
 		return
 	}
