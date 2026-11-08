@@ -42,3 +42,29 @@ security:
   max_request_body: 1048576
   enable_uploads: true
   outbound_network: false
+
+protocols:
+  ssh:
+    enabled: true
+    listen_address: "0.0.0.0:2222"
+    host_key_path: ""
+    max_connections: 100
+    auth_timeout: "30s"
+    banner: "SSH-2.0-DARKSCOPE"
+  http:
+    enabled: true
+    listen_address: "0.0.0.0:8080"
+    max_connections: 200
+    read_timeout: "10s"
+    write_timeout: "10s"
+    idle_timeout: "30s"
+    max_body_size: 1048576
+  telnet:
+    enabled: true
+    listen_address: "0.0.0.0:2323"
+    max_connections: 50
+    read_timeout: "10s"
+    write_timeout: "10s"
+    idle_timeout: "30s"
+    login_timeout: "60s"
+    banner: "DARKSCOPE Telnet Service"

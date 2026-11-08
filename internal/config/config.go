@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -74,6 +75,46 @@ type EventBus struct {
 	Workers    int `yaml:"workers"`
 }
 
+// SSHConfig содержит настройки SSH сборщика.
+type SSHConfig struct {
+	Enabled       bool          `yaml:"enabled"`
+	ListenAddress string        `yaml:"listen_address"`
+	HostKeyPath   string        `yaml:"host_key_path"`
+	MaxConnections int         `yaml:"max_connections"`
+	AuthTimeout   time.Duration `yaml:"auth_timeout"`
+	Banner        string        `yaml:"banner"`
+}
+
+// HTTPConfig содержит настройки HTTP сборщика.
+type HTTPConfig struct {
+	Enabled       bool          `yaml:"enabled"`
+	ListenAddress string        `yaml:"listen_address"`
+	MaxConnections int         `yaml:"max_connections"`
+	ReadTimeout   time.Duration `yaml:"read_timeout"`
+	WriteTimeout  time.Duration `yaml:"write_timeout"`
+	IdleTimeout   time.Duration `yaml:"idle_timeout"`
+	MaxBodySize   int64         `yaml:"max_body_size"`
+}
+
+// TelnetConfig содержит настройки Telnet сборщика.
+type TelnetConfig struct {
+	Enabled       bool          `yaml:"enabled"`
+	ListenAddress string        `yaml:"listen_address"`
+	MaxConnections int         `yaml:"max_connections"`
+	ReadTimeout   time.Duration `yaml:"read_timeout"`
+	WriteTimeout  time.Duration `yaml:"write_timeout"`
+	IdleTimeout   time.Duration `yaml:"idle_timeout"`
+	LoginTimeout  time.Duration `yaml:"login_timeout"`
+	Banner        string        `yaml:"banner"`
+}
+
+// Protocols содержит настройки всех протокольных сборщиков.
+type Protocols struct {
+	SSH   SSHConfig   `yaml:"ssh"`
+	HTTP  HTTPConfig  `yaml:"http"`
+	Telnet TelnetConfig `yaml:"telnet"`
+}
+
 // Config — корневая конфигурация приложения.
 type Config struct {
 	Listen    Listen    `yaml:"listen"`
@@ -83,6 +124,7 @@ type Config struct {
 	Detection Detection `yaml:"detection"`
 	Alerts    Alerts    `yaml:"alerts"`
 	Security  Security  `yaml:"security"`
+	Protocols Protocols `yaml:"protocols"`
 }
 
 // Load загружает конфигурацию из YAML-файла.
@@ -130,7 +172,6 @@ func (c *Config) validate() error {
 }
 
 // TelegramBotToken возвращает значение токена бота из переменной окружения.
-// Пустая строка, если переменная не задана (опциональный алерт-канал).
 func (c *Config) TelegramBotToken() string {
 	return os.Getenv(c.Alerts.Telegram.BotTokenEnv)
 }
