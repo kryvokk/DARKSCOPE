@@ -59,6 +59,10 @@ protocols:
     write_timeout: "10s"
     idle_timeout: "30s"
     max_body_size: 1048576
+    max_headers: 64
+    # TLS отключён по умолчанию. Для включения задайте оба пути:
+    # tls_cert_file: "/etc/darkscope/server.crt"
+    # tls_key_file: "/etc/darkscope/server.key"
   telnet:
     enabled: true
     listen_address: "0.0.0.0:2323"
