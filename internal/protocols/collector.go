@@ -105,6 +105,13 @@ func (b *BaseCollector) GetRunning() *int32 {
 	return &b.running
 }
 
+
+
+// SetConnLimiter устанавливает канал для ограничения количества соединений.
+func (b *BaseCollector) SetConnLimiter(ch chan struct{}) {
+	b.connLimiter = ch
+}
+
 var _ = CollectorConfig{}
 var _ = session.Session{}
 var _ = event.Event{}
