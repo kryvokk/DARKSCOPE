@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,14 +58,40 @@ func TestAppProtocolEventPipelineAndShutdown(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	sshConn, _, _, err := ssh.NewClientConn(mustDial(t, addrs["ssh"]), addrs["ssh"], &ssh.ClientConfig{
+	sshRaw := mustDial(t, addrs["ssh"])
+	sshConn, chans, reqs, err := ssh.NewClientConn(sshRaw, addrs["ssh"], &ssh.ClientConfig{
 		User: "audit", Auth: []ssh.AuthMethod{ssh.Password("secret")}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 2 * time.Second,
 	})
 	if err != nil {
 		cancel()
 		t.Fatalf("SSH handshake: %v", err)
 	}
-	_ = sshConn.Close()
+	sshClient := ssh.NewClient(sshConn, chans, reqs)
+	defer sshClient.Close()
+	sshCh, sshReqs, err := sshClient.OpenChannel("session", nil)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	go ssh.DiscardRequests(sshReqs)
+	_, err = sshCh.SendRequest("shell", true, nil)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(sshCh, "cat /etc/shadow\r")
+	_ = sshRaw.SetReadDeadline(time.Now().Add(2 * time.Second))
+	sshOut := make([]byte, 8192)
+	var got strings.Builder
+	for !strings.Contains(got.String(), "not-a-real-hash") {
+		n, e := sshCh.Read(sshOut)
+		if e != nil {
+			cancel()
+			t.Fatalf("SSH command output %q: %v", got.String(), e)
+		}
+		got.Write(sshOut[:n])
+	}
+	_ = sshCh.Close()
 
 	telnetConn, err := net.DialTimeout("tcp", addrs["telnet"], 2*time.Second)
 	if err != nil {
@@ -82,7 +109,30 @@ func TestAppProtocolEventPipelineAndShutdown(t *testing.T) {
 		cancel()
 		t.Fatalf("Telnet password prompt: %v", err)
 	}
+	for i := 0; i < 2; i++ {
+		_, _ = io.WriteString(telnetConn, "secret\r\n")
+		if _, err = reader.ReadString(':'); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(telnetConn, "audit\r\n")
+		if _, err = reader.ReadString(':'); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+	}
 	_, _ = io.WriteString(telnetConn, "secret\r\n")
+	_, _ = reader.ReadString('$')
+	_, _ = io.WriteString(telnetConn, "cat /etc/shadow\r\n")
+	telOut := ""
+	for !strings.Contains(telOut, "not-a-real-hash") {
+		line, e := reader.ReadString('\n')
+		if e != nil {
+			cancel()
+			t.Fatalf("Telnet output %q: %v", telOut, e)
+		}
+		telOut += line
+	}
 	_ = telnetConn.Close()
 	cancel()
 	select {
@@ -116,6 +166,15 @@ func TestAppProtocolEventPipelineAndShutdown(t *testing.T) {
 	}
 	if requestCount != 1 {
 		t.Fatalf("stored HTTP request events = %d, want 1", requestCount)
+	}
+	for _, protocol := range []string{"ssh", "telnet"} {
+		var n int
+		if err = store.DB().QueryRow(`SELECT COUNT(*) FROM events WHERE protocol=? AND event_type='honeytoken_access'`, protocol).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n < 1 {
+			t.Fatalf("no %s honeytoken events stored", protocol)
+		}
 	}
 }
 
