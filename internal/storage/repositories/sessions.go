@@ -67,7 +67,9 @@ func (r *SessionRepository) Get(ctx context.Context, id string) (*session.Sessio
 	}
 	defer stmt.Close()
 	var s session.Session
-	var startedAt, endedAt, status string
+	var startedAt string
+	var endedAt sql.NullString
+	var status string
 	err = stmt.QueryRowContext(ctx, id).Scan(&s.ID, &s.SourceIP, &s.SourcePort, &s.Protocol, &startedAt, &endedAt, &s.EventCount, &status)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -76,8 +78,8 @@ func (r *SessionRepository) Get(ctx context.Context, id string) (*session.Sessio
 		return nil, fmt.Errorf("scan session: %w", err)
 	}
 	s.StartTime, _ = time.Parse(time.RFC3339Nano, startedAt)
-	if endedAt != "" {
-		s.EndTime, _ = time.Parse(time.RFC3339Nano, endedAt)
+	if endedAt.Valid {
+		s.EndTime, _ = time.Parse(time.RFC3339Nano, endedAt.String)
 	}
 	s.Duration = s.EndTime.Sub(s.StartTime)
 	s.Status = session.Status(status)
@@ -100,13 +102,15 @@ func (r *SessionRepository) List(ctx context.Context, limit, offset int) ([]*ses
 	var out []*session.Session
 	for rows.Next() {
 		var s session.Session
-		var startedAt, endedAt, status string
+		var startedAt string
+		var endedAt sql.NullString
+		var status string
 		if err := rows.Scan(&s.ID, &s.SourceIP, &s.SourcePort, &s.Protocol, &startedAt, &endedAt, &s.EventCount, &status); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		s.StartTime, _ = time.Parse(time.RFC3339Nano, startedAt)
-		if endedAt != "" {
-			s.EndTime, _ = time.Parse(time.RFC3339Nano, endedAt)
+		if endedAt.Valid {
+			s.EndTime, _ = time.Parse(time.RFC3339Nano, endedAt.String)
 		}
 		s.Duration = s.EndTime.Sub(s.StartTime)
 		s.Status = session.Status(status)
