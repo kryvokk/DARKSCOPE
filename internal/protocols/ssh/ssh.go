@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"darkscope/honeypot/internal/config"
+	"darkscope/honeypot/internal/emulator"
 	"darkscope/honeypot/internal/event"
 	"darkscope/honeypot/internal/protocols"
 	"darkscope/honeypot/internal/session"
@@ -325,10 +326,11 @@ func (c *Collector) handleConn(conn net.Conn) {
 	}, event.SeverityHigh)
 
 	go ssh.DiscardRequests(reqs)
+	shell := emulator.New(sessionID, "ssh", emulator.BusPublisher{Bus: c.publisher, SourceIP: host, SourcePort: mustAtoi(port), DestPort: c.destPort(), Protocol: "ssh"})
 
 	for newChannel := range chans {
 		c.wg.Add(1)
-		go c.handleChannel(newChannel, sessionID, host, port)
+		go c.handleChannel(newChannel, sessionID, host, port, shell)
 	}
 
 	sshConn.Wait()
@@ -337,21 +339,80 @@ func (c *Collector) handleConn(conn net.Conn) {
 	c.publishEvent(sessionID, host, port, "ssh", "ssh", event.EventTypeDisconnect, nil, event.SeverityLow)
 }
 
-func (c *Collector) handleChannel(newChannel ssh.NewChannel, sessionID, host, port string) {
+func (c *Collector) handleChannel(newChannel ssh.NewChannel, sessionID, host, port string, shell *emulator.Emulator) {
 	defer c.wg.Done()
 
 	channelType := newChannel.ChannelType()
 	c.log.Debug("ssh channel opened", "session_id", sessionID, "channel_type", channelType)
 
-	// Реальный shell не предоставляется: попытка открытия канала
-	// фиксируется и отклоняется. Каналы не выполняют команды хоста.
-	newChannel.Reject(ssh.Prohibited, "channel not supported")
-
-	c.sessions.RecordCommand(sessionID)
-	c.publishEvent(sessionID, host, port, "ssh", "ssh", event.EventTypeCommand, map[string]interface{}{
-		"channel_type": channelType,
-		"action":       "channel_rejected",
-	}, event.SeverityLow, nil)
+	if channelType != "session" {
+		_ = newChannel.Reject(ssh.UnknownChannelType, "unsupported channel")
+		return
+	}
+	ch, requests, err := newChannel.Accept()
+	if err != nil {
+		return
+	}
+	defer ch.Close()
+	pty := false
+	for req := range requests {
+		switch req.Type {
+		case "pty-req":
+			pty = true
+			_ = req.Reply(true, nil)
+		case "shell":
+			if pty {
+				_ = req.Reply(true, nil)
+			} else {
+				_ = req.Reply(true, nil)
+			}
+			_, _ = io.WriteString(ch, "DARKSCOPE virtual Linux\r\n"+shell.User+"@"+shell.Host+":"+shell.Cwd+"$ ")
+			line := make([]byte, 0, 128)
+			for {
+				b := make([]byte, 1)
+				n, e := ch.Read(b)
+				if e != nil {
+					return
+				}
+				if n == 0 {
+					continue
+				}
+				switch b[0] {
+				case 3:
+					line = line[:0]
+					_, _ = io.WriteString(ch, "^C\r\n")
+				case 4:
+					if len(line) == 0 {
+						return
+					}
+					line = line[:0]
+					_, _ = io.WriteString(ch, "\r\n")
+				case 8, 127:
+					if len(line) > 0 {
+						line = line[:len(line)-1]
+						_, _ = io.WriteString(ch, "\b \b")
+					}
+				case '\r', '\n':
+					cmd := string(line)
+					line = line[:0]
+					_, _ = io.WriteString(ch, "\r\n")
+					if strings.TrimSpace(cmd) == "exit" || strings.TrimSpace(cmd) == "logout" {
+						return
+					}
+					res := shell.Execute(cmd)
+					_, _ = io.WriteString(ch, res.Out+res.Err)
+					_, _ = io.WriteString(ch, shell.User+"@"+shell.Host+":"+shell.Cwd+"$ ")
+				default:
+					if b[0] >= 32 && b[0] < 127 && len(line) < emulator.MaxCommandBytes {
+						line = append(line, b[0])
+						_, _ = ch.Write(b)
+					}
+				}
+			}
+		default:
+			_ = req.Reply(false, nil)
+		}
+	}
 }
 
 // publishOption — необязательная донастройка события перед публикацией.

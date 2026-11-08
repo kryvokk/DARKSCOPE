@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"darkscope/honeypot/internal/config"
+	"darkscope/honeypot/internal/emulator"
 	"darkscope/honeypot/internal/event"
 	"darkscope/honeypot/internal/protocols"
 	"darkscope/honeypot/internal/session"
@@ -173,11 +174,38 @@ func (c *Collector) handleConn(conn net.Conn) {
 		c.publishEvent(sid, host, port, event.EventTypeLoginAttempt, map[string]interface{}{
 			"username": user, "password": "***", "password_length": len(strings.TrimSpace(pass)), "attempt": attempt + 1, "result": "rejected",
 		}, event.SeverityMedium)
-		if err := write("Login incorrect\r\nlogin: "); err != nil {
-			return
+		if attempt < 2 {
+			if err := write("Login incorrect\r\nlogin: "); err != nil {
+				return
+			}
 		}
 	}
-	_ = write("Too many attempts.\r\n")
+	_ = write("\r\nWelcome to DARKSCOPE. Type exit to disconnect.\r\n")
+	shell := emulator.New(sid, "telnet", emulator.BusPublisher{Bus: c.publisher, SourceIP: host, SourcePort: mustAtoi(port), DestPort: c.destPort(), Protocol: "telnet"})
+	for {
+		if err := write(shell.User + "@" + shell.Host + ":" + shell.Cwd + "$ "); err != nil {
+			return
+		}
+		line, err := readTelnetLine(r, emulator.MaxCommandBytes)
+		if err != nil {
+			return
+		}
+		line = strings.TrimSpace(line)
+		if line == "exit" || line == "logout" {
+			return
+		}
+		res := shell.Execute(line)
+		if res.Out != "" {
+			if err = write(res.Out); err != nil {
+				return
+			}
+		}
+		if res.Err != "" {
+			if err = write(res.Err); err != nil {
+				return
+			}
+		}
+	}
 }
 
 // readTelnetLine bounds input and removes Telnet IAC negotiation sequences.
