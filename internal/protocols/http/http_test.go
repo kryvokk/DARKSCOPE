@@ -322,6 +322,7 @@ func TestHTTPSessionPerConnection(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET #%d: %v", i, err)
 		}
+		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 
@@ -499,26 +500,23 @@ func TestHTTPHeaderCap(t *testing.T) {
 		t.Fatalf("GET with 12 headers: %v", err)
 	}
 	resp.Body.Close()
+	if resp.StatusCode != nethttp.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("status = %d, want 431", resp.StatusCode)
+	}
 
-	var request *event.Event
 	ok := waitForCond(t, func() bool {
 		for _, ev := range capture.Events() {
-			if ev.EventType == event.EventTypeRequest {
-				request = ev
-				return true
+			if ev.EventType == event.EventTypeProtocolError {
+				p, _ := ev.Payload.(map[string]interface{})
+				if p["reason"] == "too_many_headers" {
+					return true
+				}
 			}
 		}
 		return false
 	}, 3*time.Second)
 	if !ok {
-		t.Fatal("no request event")
-	}
-	headers := request.Payload.(map[string]interface{})["headers"].(map[string]string)
-	if len(headers) > 5 {
-		t.Errorf("headers stored = %d, want <= 5 (limit)", len(headers))
-	}
-	if len(headers) == 0 {
-		t.Error("no headers stored at all")
+		t.Fatal("no protocol_error for excessive request headers")
 	}
 }
 

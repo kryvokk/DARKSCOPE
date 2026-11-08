@@ -117,7 +117,12 @@ func New(cfg *config.HTTPConfig, publisher protocols.Publisher, sessMgr *session
 func (c *Collector) Name() string { return "http" }
 
 // ListenAddr возвращает адрес прослушивания.
-func (c *Collector) ListenAddr() string { return c.cfg.ListenAddress }
+func (c *Collector) ListenAddr() string {
+	if c.listener != nil {
+		return c.listener.Addr().String()
+	}
+	return c.cfg.ListenAddress
+}
 
 // destPort возвращает фактический порт прослушивания (0 до старта).
 func (c *Collector) destPort() int {
@@ -248,6 +253,13 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	host, port, _ := net.SplitHostPort(r.RemoteAddr)
+	if len(r.Header) > c.cfg.MaxHeaders {
+		_ = c.BaseCollector.Sessions.RecordEvent(sessionID)
+		c.publishEvent(sessionID, host, port, "http", "http", event.EventTypeProtocolError,
+			map[string]interface{}{"reason": "too_many_headers", "count": len(r.Header), "limit": c.cfg.MaxHeaders}, event.SeverityMedium)
+		http.Error(w, "too many headers", http.StatusRequestHeaderFieldsTooLarge)
+		return
+	}
 
 	// Заголовки ограничены по числу и длине: собранные данные не
 	// должны становиться каналом исчерпания памяти.
@@ -382,10 +394,11 @@ func (c *Collector) Stop(ctx context.Context) error {
 
 	// Graceful shutdown самого сервера: слушатель закрывается, активным
 	// запросам даётся время завершиться (ceiling 10 c).
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancelShutdown := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelShutdown()
 	if err := c.server.Shutdown(shutdownCtx); err != nil {
 		c.log.Warn("http server shutdown error", "error", err)
+		_ = c.server.Close()
 	}
 
 	if c.listener != nil {
@@ -400,7 +413,21 @@ func (c *Collector) Stop(ctx context.Context) error {
 
 	select {
 	case <-done:
-		return nil
+		// ConnState callbacks publish disconnect events. Wait for them before
+		// allowing App to stop the event bus.
+		for {
+			c.connsMu.Lock()
+			remaining := len(c.conns)
+			c.connsMu.Unlock()
+			if remaining == 0 {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
