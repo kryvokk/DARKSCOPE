@@ -87,6 +87,19 @@ security:
 	}
 }
 
+func TestLoadExampleConfig(t *testing.T) {
+	cfg, err := Load("../../configs/config.example.yaml")
+	if err != nil {
+		t.Fatalf("load example config: %v", err)
+	}
+	if cfg.Protocols.HTTP.MaxHeaders != 64 {
+		t.Fatalf("HTTP max_headers = %d, want 64", cfg.Protocols.HTTP.MaxHeaders)
+	}
+	if cfg.Protocols.Telnet.LoginTimeout <= 0 {
+		t.Fatal("Telnet login_timeout must be positive")
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	_, err := Load("/nonexistent/path/config.yaml")
 	if err == nil {
