@@ -87,13 +87,16 @@ type SSHConfig struct {
 
 // HTTPConfig содержит настройки HTTP сборщика.
 type HTTPConfig struct {
-	Enabled       bool          `yaml:"enabled"`
-	ListenAddress string        `yaml:"listen_address"`
-	MaxConnections int         `yaml:"max_connections"`
-	ReadTimeout   time.Duration `yaml:"read_timeout"`
-	WriteTimeout  time.Duration `yaml:"write_timeout"`
-	IdleTimeout   time.Duration `yaml:"idle_timeout"`
-	MaxBodySize   int64         `yaml:"max_body_size"`
+	Enabled        bool          `yaml:"enabled"`
+	ListenAddress  string        `yaml:"listen_address"`
+	MaxConnections int           `yaml:"max_connections"`
+	ReadTimeout    time.Duration `yaml:"read_timeout"`
+	WriteTimeout   time.Duration `yaml:"write_timeout"`
+	IdleTimeout    time.Duration `yaml:"idle_timeout"`
+	MaxBodySize    int64         `yaml:"max_body_size"`
+	MaxHeaders     int           `yaml:"max_headers"`
+	TLSCertFile    string        `yaml:"tls_cert_file"`
+	TLSKeyFile     string        `yaml:"tls_key_file"`
 }
 
 // TelnetConfig содержит настройки Telnet сборщика.
