@@ -5,15 +5,13 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // Ошибки шины события.
 var (
-	ErrBusStopped  = errors.New("event bus is stopped")
-	ErrQueueFull   = errors.New("event queue is full")
-	ErrAlreadyStar = errors.New("event bus already started")
-	ErrNotStarted  = errors.New("event bus not started")
+	ErrBusStopped      = errors.New("event bus is stopped")
+	ErrQueueFull       = errors.New("event queue is full")
+	ErrAlreadyStarted  = errors.New("event bus already started")
 )
 
 // Processor обрабатывает событие. nil означает "подсчитать как доставленное".
@@ -98,7 +96,7 @@ func (b *EventBus) SetProcessors(storage, detection, alert Processor) {
 // Start запускает диспетчер и воркеры подписчиков.
 func (b *EventBus) Start(ctx context.Context) error {
 	if !b.started.CompareAndSwap(false, true) {
-		return ErrAlreadyStar
+		return ErrAlreadyStarted
 	}
 	if b.stopped.Load() {
 		return ErrBusStopped
@@ -128,6 +126,7 @@ func (b *EventBus) Start(ctx context.Context) error {
 
 // Publish публикует событие. Не блокирует вызывающего: при переполнении
 // входной очереди событие отбрасывается и возвращается ErrQueueFull.
+// После остановки шины возвращает ErrBusStopped.
 func (b *EventBus) Publish(ev *Event) error {
 	if b.stopped.Load() {
 		return ErrBusStopped
@@ -144,17 +143,32 @@ func (b *EventBus) Publish(ev *Event) error {
 
 // dispatch читает события из основной очереди и независимо разносит их
 // по очередям подписчиков (неблокирующе). Медленный подписчик не блокирует
-// остальные.
+// остальные. При остановке дочитывает все оставшиеся события из in
+// неблокирующе (in не закрывается явно, чтобы избежать race с Publish).
 func (b *EventBus) dispatch() {
 	defer b.wg.Done()
 	for {
 		select {
 		case <-b.stopCh:
+			// Дреним все оставшиеся события из in неблокирующе.
+			for {
+				select {
+				case ev, ok := <-b.in:
+					if !ok {
+						goto drainDone
+					}
+					b.fanOut(ev)
+				default:
+					goto drainDone // in пуст
+				}
+			}
+		drainDone:
+			close(b.storageChan)
+			close(b.detectionChan)
+			close(b.alertChan)
 			return
 		case ev, ok := <-b.in:
 			if !ok {
-				// Входная очередь закрыта — закрываем очереди подписчиков
-				// после того, как они будут прочитаны воркерами.
 				close(b.storageChan)
 				close(b.detectionChan)
 				close(b.alertChan)
@@ -199,15 +213,15 @@ func (b *EventBus) worker(ch <-chan *Event, proc Processor, processed, dropped, 
 }
 
 // Stop инициирует graceful shutdown:
-// 1. перестает принимать новые события,
-// 2. дренит очереди,
+// 1. перестает принимать новые события (устанавливает stopped),
+// 2. дренит очереди (дочитывает все события из in),
 // 3. ждет завершения всех обработчиков с таймаутом.
 func (b *EventBus) Stop(ctx context.Context) error {
 	if !b.stopped.CompareAndSwap(false, true) {
 		return nil // уже остановлен
 	}
 	close(b.stopCh)
-	close(b.in) // стоп прием, диспетчер дочитает и закроет очереди подписчиков
+	// in не закрывается здесь — диспетчер дочитает его и сам завершится.
 
 	done := make(chan struct{})
 	go func() {
@@ -248,5 +262,3 @@ func (b *EventBus) Metrics() Metrics {
 func (b *EventBus) IsStopped() bool {
 	return b.stopped.Load()
 }
-
-var _ = time.Second
