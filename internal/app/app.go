@@ -21,17 +21,17 @@ import (
 )
 
 type App struct {
-	cfg       *config.Config
-	store     *storage.Storage
-	bus       *event.EventBus
-	sessions  *session.Manager
-	events    *repositories.EventRepository
-	sessRepo  *repositories.SessionRepository
-	attackers *repositories.AttackerRepository
-	files     *repositories.FileRepository
-	alerts    *repositories.AlertRepository
+	cfg        *config.Config
+	store      *storage.Storage
+	bus        *event.EventBus
+	sessions   *session.Manager
+	events     *repositories.EventRepository
+	sessRepo   *repositories.SessionRepository
+	attackers  *repositories.AttackerRepository
+	files      *repositories.FileRepository
+	alerts     *repositories.AlertRepository
 	collectors []protocols.Collector
-	log       *slog.Logger
+	log        *slog.Logger
 }
 
 // New создает приложение: подключает хранилище, применяет миграции,
@@ -94,17 +94,17 @@ func New(cfg *config.Config) (*App, error) {
 	}
 
 	return &App{
-		cfg:       cfg,
-		store:     store,
-		bus:       bus,
-		sessions:  sessMgr,
-		events:    eventRepo,
-		sessRepo:  sessRepo,
-		attackers: attackerRepo,
-		files:     fileRepo,
-		alerts:    alertRepo,
+		cfg:        cfg,
+		store:      store,
+		bus:        bus,
+		sessions:   sessMgr,
+		events:     eventRepo,
+		sessRepo:   sessRepo,
+		attackers:  attackerRepo,
+		files:      fileRepo,
+		alerts:     alertRepo,
 		collectors: collectors,
-		log:       log,
+		log:        log,
 	}, nil
 }
 
@@ -112,7 +112,9 @@ func New(cfg *config.Config) (*App, error) {
 // после чего выполняет graceful shutdown.
 func (a *App) Run(ctx context.Context) error {
 	// Запускаем шину событий.
-	if err := a.bus.Start(ctx); err != nil {
+	// Stop the bus explicitly after collectors so context cancellation cannot
+	// race their final event publications.
+	if err := a.bus.Start(context.Background()); err != nil {
 		return fmt.Errorf("start event bus: %w", err)
 	}
 	a.log.Info("event bus started")
@@ -122,10 +124,11 @@ func (a *App) Run(ctx context.Context) error {
 	// запущенные (collectors[:i]), не затрагивая несостоявшийся.
 	for i, coll := range a.collectors {
 		if err := coll.Start(ctx); err != nil {
-			a.log.Error("collector start failed", "collector", coll.Name(), "error", err)
 			for _, started := range a.collectors[:i] {
 				_ = started.Stop(context.Background())
 			}
+			_ = a.bus.Stop(context.Background())
+			a.log.Error("collector start failed", "collector", coll.Name(), "error", err)
 			return fmt.Errorf("start collector %s: %w", coll.Name(), err)
 		}
 		a.log.Info("collector started", "collector", coll.Name(), "address", coll.ListenAddr())
