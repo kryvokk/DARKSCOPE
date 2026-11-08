@@ -20,8 +20,8 @@ import (
 
 // captureProcessor captures events for testing.
 type captureProcessor struct {
-	mu      sync.Mutex
-	events  []*event.Event
+	mu     sync.Mutex
+	events []*event.Event
 }
 
 func (c *captureProcessor) Publish(ev *event.Event) error {
@@ -41,11 +41,11 @@ func (c *captureProcessor) Events() []*event.Event {
 
 func TestSSHCollectorStartStop(t *testing.T) {
 	cfg := &config.SSHConfig{
-		Enabled:       true,
-		ListenAddress: "127.0.0.1:0",
-		AuthTimeout:   5 * time.Second,
-		MaxConnections:  10,
-		Banner:        "SSH-2.0-test",
+		Enabled:        true,
+		ListenAddress:  "127.0.0.1:0",
+		AuthTimeout:    5 * time.Second,
+		MaxConnections: 10,
+		Banner:         "SSH-2.0-test",
 	}
 	capture := &captureProcessor{}
 	sessMgr := session.NewManager()
@@ -81,11 +81,11 @@ func TestSSHCollectorStartStop(t *testing.T) {
 
 func TestSSHCollectorConnectionAndEvents(t *testing.T) {
 	cfg := &config.SSHConfig{
-		Enabled:       true,
-		ListenAddress: "127.0.0.1:0",
-		AuthTimeout:   5 * time.Second,
-		MaxConnections:  10,
-		Banner:        "SSH-2.0-test",
+		Enabled:        true,
+		ListenAddress:  "127.0.0.1:0",
+		AuthTimeout:    5 * time.Second,
+		MaxConnections: 10,
+		Banner:         "SSH-2.0-test",
 	}
 	capture := &captureProcessor{}
 	sessMgr := session.NewManager()
@@ -158,11 +158,11 @@ func TestSSHCollectorConnectionAndEvents(t *testing.T) {
 
 func TestSSHCollectorConcurrentConnections(t *testing.T) {
 	cfg := &config.SSHConfig{
-		Enabled:       true,
-		ListenAddress: "127.0.0.1:0",
-		AuthTimeout:   5 * time.Second,
-		MaxConnections:  10,
-		Banner:        "SSH-2.0-test",
+		Enabled:        true,
+		ListenAddress:  "127.0.0.1:0",
+		AuthTimeout:    5 * time.Second,
+		MaxConnections: 10,
+		Banner:         "SSH-2.0-test",
 	}
 	capture := &captureProcessor{}
 	sessMgr := session.NewManager()
@@ -302,6 +302,9 @@ func TestSSHAuthCapture(t *testing.T) {
 
 	if loginAttempt == nil {
 		t.Fatal("expected login_attempt event")
+	}
+	if want := coll.listener.Addr().(*net.TCPAddr).Port; loginAttempt.DestPort != want {
+		t.Errorf("login_attempt dest port = %d, want bound port %d", loginAttempt.DestPort, want)
 	}
 	if got := loginAttempt.Payload.(map[string]interface{})["user"]; got != "root" {
 		t.Errorf("login_attempt user = %v, want root", got)
@@ -450,4 +453,3 @@ func TestSanitizeServerVersion(t *testing.T) {
 		}
 	}
 }
-

@@ -27,11 +27,11 @@ import (
 // authAttempt хранит данные попытки аутентификации для одного соединения.
 // Пароль не сохраняется в событиях — фиксируются username и длина пароля.
 type authAttempt struct {
-	mu         sync.Mutex
-	user       string
-	passLen    int
-	clientVer  string
-	result     string // "pending" | "accepted"
+	mu        sync.Mutex
+	user      string
+	passLen   int
+	clientVer string
+	result    string // "pending" | "accepted"
 }
 
 // Collector реализует SSH Honeypot.
@@ -124,6 +124,19 @@ func (c *Collector) ListenAddr() string {
 		return c.listener.Addr().String()
 	}
 	return c.cfg.ListenAddress
+}
+
+func (c *Collector) destPort() int {
+	if c.listener != nil {
+		if addr, ok := c.listener.Addr().(*net.TCPAddr); ok {
+			return addr.Port
+		}
+	}
+	_, port, err := net.SplitHostPort(c.cfg.ListenAddress)
+	if err != nil {
+		return 0
+	}
+	return mustAtoi(port)
 }
 
 // Start запускает SSH слушатель.
@@ -347,7 +360,7 @@ type publishOption func(*event.Event)
 // publishEvent формирует нормализованное событие и публикует его через publisher.
 func (c *Collector) publishEvent(sessionID, sourceIP, sourcePort, protocol, service string,
 	et event.EventType, payload interface{}, severity event.Severity, opts ...publishOption) {
-	ev := event.NewEvent(sessionID, sourceIP, "127.0.0.1", mustAtoi(sourcePort), 22, protocol, service, et, payload)
+	ev := event.NewEvent(sessionID, sourceIP, "127.0.0.1", mustAtoi(sourcePort), c.destPort(), protocol, service, et, payload)
 	ev.WithSeverity(severity).WithConfidence(0.9)
 	for _, opt := range opts {
 		opt(ev)

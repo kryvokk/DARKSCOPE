@@ -66,6 +66,19 @@ func (c *Collector) ListenAddr() string {
 	return c.cfg.ListenAddress
 }
 
+func (c *Collector) destPort() int {
+	if c.listener != nil {
+		if addr, ok := c.listener.Addr().(*net.TCPAddr); ok {
+			return addr.Port
+		}
+	}
+	_, port, err := net.SplitHostPort(c.cfg.ListenAddress)
+	if err != nil {
+		return 0
+	}
+	return mustAtoi(port)
+}
+
 func (c *Collector) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	c.BaseCollector.SetContext(ctx, cancel)
@@ -251,7 +264,7 @@ func (c *Collector) Stop(ctx context.Context) error {
 }
 
 func (c *Collector) publishEvent(sid, ip, srcPort string, typ event.EventType, payload interface{}, severity event.Severity) {
-	ev := event.NewEvent(sid, ip, "127.0.0.1", mustAtoi(srcPort), 23, "telnet", "telnet", typ, payload)
+	ev := event.NewEvent(sid, ip, "127.0.0.1", mustAtoi(srcPort), c.destPort(), "telnet", "telnet", typ, payload)
 	ev.WithSeverity(severity).WithConfidence(0.9)
 	if err := c.publisher.Publish(ev); err != nil {
 		c.log.Warn("telnet publish event failed", "error", err)

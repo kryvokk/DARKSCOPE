@@ -89,6 +89,9 @@ func TestTelnetCapturesCredentialsWithoutShellAndStopsActiveConn(t *testing.T) {
 	if login == nil {
 		t.Fatal("missing login attempt")
 	}
+	if want := c.listener.Addr().(*net.TCPAddr).Port; login.DestPort != want {
+		t.Errorf("login attempt dest port = %d, want bound port %d", login.DestPort, want)
+	}
 	p := login.Payload.(map[string]interface{})
 	if p["username"] != "root" || p["password"] != "***" || p["password_length"] != 6 {
 		t.Fatalf("unexpected credential payload: %#v", p)
