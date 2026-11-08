@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 const MaxCommandBytes = 4096
@@ -24,10 +25,23 @@ type Emulator struct {
 	Cwd, User, Host, SessionID, Protocol string
 	History                              []string
 	publisher                            Publisher
+	Env                                  Environment
+}
+
+type Environment struct {
+	Hostname, Kernel, Architecture, Date string
+	Uptime                               time.Duration
+	Variables                            map[string]string
+	Processes                            []string
+	Interfaces                           map[string]string
+	Connections                          []string
+	Filesystems                          []string
+	MemoryTotal, MemoryUsed              int64
+	Mounts                               []string
 }
 
 func New(sessionID, protocol string, p Publisher) *Emulator {
-	return &Emulator{FS: NewFS(), Cwd: "/home/user", User: "user", Host: "darkscope", SessionID: sessionID, Protocol: protocol, publisher: p}
+	return &Emulator{FS: NewFS(), Cwd: "/home/user", User: "user", Host: "darkscope", SessionID: sessionID, Protocol: protocol, publisher: p, Env: Environment{Hostname: "darkscope", Kernel: "6.1.0-fake", Architecture: "x86_64", Date: "Sun Nov  8 00:00:00 UTC 2026", Uptime: 72 * time.Hour, Variables: map[string]string{"HOME": "/home/user", "USER": "user", "SHELL": "/bin/bash"}, Processes: []string{"1 init", "42 sshd: user"}, Interfaces: map[string]string{"lo": "127.0.0.1", "eth0": "192.0.2.10/24"}, Connections: []string{"tcp LISTEN 0 128 0.0.0.0:2222", "tcp LISTEN 0 128 0.0.0.0:8080", "tcp LISTEN 0 128 0.0.0.0:2323"}, Filesystems: []string{"/dev/fake 20G 4G 16G 20% /"}, MemoryTotal: 2048000, MemoryUsed: 512000, Mounts: []string{"/dev/fake on / type ext4 (rw)", "proc on /proc type proc (ro)"}}}
 }
 
 // Parse implements a deliberately small shell-like lexer. Operators and command substitution are rejected.
@@ -156,15 +170,15 @@ func (e *Emulator) execute(a []string) Result {
 	case "whoami":
 		return Result{Out: e.User + "\n"}
 	case "hostname":
-		return Result{Out: e.Host + "\n"}
+		return Result{Out: e.Env.Hostname + "\n"}
 	case "uname":
-		return Result{Out: "Linux darkscope 6.1.0-fake x86_64 GNU/Linux\n"}
+		return Result{Out: "Linux " + e.Env.Hostname + " " + e.Env.Kernel + " " + e.Env.Architecture + " GNU/Linux\n"}
 	case "id":
 		return Result{Out: "uid=1000(user) gid=1000(user) groups=1000(user)\n"}
 	case "date":
-		return Result{Out: "Sun Nov  8 00:00:00 UTC 2026\n"}
+		return Result{Out: e.Env.Date + "\n"}
 	case "uptime":
-		return Result{Out: " 00:12:34 up 3 days,  4:21,  1 user,  load average: 0.02, 0.01, 0.00\n"}
+		return Result{Out: fmt.Sprintf("up %s, 1 user, load average: 0.02, 0.01, 0.00\n", e.Env.Uptime)}
 	case "echo", "printf":
 		return Result{Out: strings.Join(args, " ") + map[bool]string{true: "", false: "\n"}[cmd == "printf"]}
 	case "help", "man":
@@ -226,12 +240,20 @@ func (e *Emulator) execute(a []string) Result {
 	case "find":
 		base := "."
 		needle := ""
-		for i, a := range args {
-			if a == "-name" && i+1 < len(args) {
-				needle = strings.Trim(args[i+1], "'\"")
-			} else if !strings.HasPrefix(a, "-") {
-				base = a
+		for i := 0; i < len(args); i++ {
+			a := args[i]
+			if a == "-name" {
+				if i+1 >= len(args) {
+					return fail(errors.New("-name requires a pattern"))
+				}
+				i++
+				needle = strings.Trim(args[i], "'\"")
+				continue
 			}
+			if strings.HasPrefix(a, "-") {
+				return fail(fmt.Errorf("unsupported find option %s", a))
+			}
+			base = a
 		}
 		root, err := e.FS.Resolve(base, e.Cwd)
 		if err != nil {
@@ -336,19 +358,38 @@ func (e *Emulator) execute(a []string) Result {
 		}
 		return Result{}
 	case "env", "printenv":
-		return Result{Out: "HOME=/home/user\nUSER=user\nSHELL=/bin/bash\nPWD=" + e.Cwd + "\n"}
+		vars := make(map[string]string, len(e.Env.Variables)+1)
+		for k, v := range e.Env.Variables {
+			vars[k] = v
+		}
+		vars["PWD"] = e.Cwd
+		if len(args) > 0 {
+			return Result{Out: vars[args[0]] + "\n"}
+		}
+		var b strings.Builder
+		for k, v := range vars {
+			fmt.Fprintf(&b, "%s=%s\n", k, v)
+		}
+		return Result{Out: b.String()}
 	case "ps", "top":
-		return Result{Out: "PID TTY TIME CMD\n1 ? 00:00:01 init\n42 ? 00:00:00 sshd: user\n"}
+		return Result{Out: "PID TTY TIME CMD\n" + strings.Join(e.Env.Processes, "\n") + "\n"}
 	case "df":
-		return Result{Out: "Filesystem Size Used Avail Use% Mounted on\n/dev/fake 20G 4G 16G 20% /\n"}
+		return Result{Out: "Filesystem Size Used Avail Use% Mounted on\n" + strings.Join(e.Env.Filesystems, "\n") + "\n"}
 	case "free":
-		return Result{Out: "              total        used        free\nMem:        2048000      512000     1536000\n"}
+		return Result{Out: fmt.Sprintf("              total        used        free\nMem:        %d      %d     %d\n", e.Env.MemoryTotal, e.Env.MemoryUsed, e.Env.MemoryTotal-e.Env.MemoryUsed)}
 	case "ip", "ifconfig":
-		return Result{Out: "lo: 127.0.0.1\neth0: 192.0.2.10/24\n"}
+		var b strings.Builder
+		for name, addr := range e.Env.Interfaces {
+			fmt.Fprintf(&b, "%s: %s\n", name, addr)
+		}
+		return Result{Out: b.String()}
 	case "ping", "curl", "wget", "ssh", "scp":
 		return Result{Out: "network operation simulated; no connection made\n"}
 	case "netstat", "ss", "mount":
-		return Result{Out: "tcp LISTEN 0 128 0.0.0.0:2222\ntcp LISTEN 0 128 0.0.0.0:8080\ntcp LISTEN 0 128 0.0.0.0:2323\n"}
+		if cmd == "mount" {
+			return Result{Out: strings.Join(e.Env.Mounts, "\n") + "\n"}
+		}
+		return Result{Out: strings.Join(e.Env.Connections, "\n") + "\n"}
 	case "which":
 		if len(args) > 0 {
 			for _, n := range commandNames {
