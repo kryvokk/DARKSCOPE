@@ -1,8 +1,8 @@
 package telnet
 
 import (
-	"context"
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -19,254 +19,229 @@ import (
 	"darkscope/honeypot/internal/session"
 )
 
-// Collector реализует Telnet Honeypot.
+const maxInputLine = 256
+
+// Collector is a credential-capture-only Telnet honeypot. It never offers a shell.
 type Collector struct {
 	protocols.BaseCollector
-	cfg     *config.TelnetConfig
-	listener net.Listener
-	log     *slog.Logger
+	cfg       *config.TelnetConfig
+	listener  net.Listener
+	log       *slog.Logger
 	publisher protocols.Publisher
+	mu        sync.Mutex
+	conns     map[net.Conn]struct{}
 }
 
-// New создаёт новый Telnet Collectор.
-func New(cfg *config.TelnetConfig, eventBus protocols.Publisher, sessMgr *session.Manager, log *slog.Logger) (*Collector, error) {
-	return &Collector{
-		BaseCollector: protocols.BaseCollector{Sessions: sessMgr},
-		cfg:           cfg,
-		log:           log,
-		publisher:     eventBus,
-	}, nil
+func New(cfg *config.TelnetConfig, publisher protocols.Publisher, sessMgr *session.Manager, log *slog.Logger) (*Collector, error) {
+	if cfg == nil || publisher == nil || sessMgr == nil || log == nil {
+		return nil, errors.New("telnet collector requires config, publisher, session manager, and logger")
+	}
+	c := *cfg
+	if c.MaxConnections <= 0 {
+		c.MaxConnections = 50
+	}
+	if c.LoginTimeout <= 0 {
+		c.LoginTimeout = 60 * time.Second
+	}
+	if c.IdleTimeout <= 0 {
+		c.IdleTimeout = 30 * time.Second
+	}
+	if c.ReadTimeout <= 0 {
+		c.ReadTimeout = 10 * time.Second
+	}
+	if c.WriteTimeout <= 0 {
+		c.WriteTimeout = 10 * time.Second
+	}
+	if c.Banner == "" {
+		c.Banner = "DARKSCOPE Telnet Service"
+	}
+	return &Collector{BaseCollector: protocols.BaseCollector{Sessions: sessMgr}, cfg: &c, publisher: publisher, log: log, conns: make(map[net.Conn]struct{})}, nil
 }
 
-// Name возвращает имя протокола.
 func (c *Collector) Name() string { return "telnet" }
+func (c *Collector) ListenAddr() string {
+	if c.listener != nil {
+		return c.listener.Addr().String()
+	}
+	return c.cfg.ListenAddress
+}
 
-// ListenAddr возвращает адрес прослушивания.
-func (c *Collector) ListenAddr() string { return c.cfg.ListenAddress }
-
-// Start запускает Telnet слушатель.
 func (c *Collector) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	c.BaseCollector.SetContext(ctx, cancel)
-
-	listener, err := net.Listen("tcp", c.cfg.ListenAddress)
+	l, err := net.Listen("tcp", c.cfg.ListenAddress)
 	if err != nil {
+		cancel()
 		return fmt.Errorf("listen telnet: %w", err)
 	}
-	c.BaseCollector.Listener = listener
-	c.listener = listener
-
+	c.listener, c.BaseCollector.Listener = l, l
+	c.BaseCollector.SetConnLimiter(make(chan struct{}, c.cfg.MaxConnections))
 	c.BaseCollector.SetRunning(true)
-
-	// Ограничиваем количество одновременных соединений.
-	if c.cfg.MaxConnections > 0 {
-		c.BaseCollector.SetConnLimiter(make(chan struct{}, c.cfg.MaxConnections))
-	}
-
 	c.BaseCollector.GetWG().Add(1)
 	go c.acceptLoop()
-
-	c.log.Info("telnet collector started", "address", c.cfg.ListenAddress)
 	return nil
 }
 
-// acceptLoop принимает входящие TCP-подключения.
 func (c *Collector) acceptLoop() {
 	defer c.BaseCollector.GetWG().Done()
-
 	for {
-		conn, err := c.BaseCollector.Listener.Accept()
+		conn, err := c.listener.Accept()
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
+			if !errors.Is(err, net.ErrClosed) {
+				c.log.Warn("telnet accept failed", "error", err)
 			}
-			c.log.Error("telnet accept error", "error", err)
 			return
 		}
-
 		if !c.BaseCollector.AcquireConn() {
-			c.log.Warn("telnet connection limit reached, rejecting", "remote", conn.RemoteAddr())
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
-
+		c.mu.Lock()
+		if !c.BaseCollector.IsRunning() {
+			c.mu.Unlock()
+			c.BaseCollector.ReleaseConn()
+			_ = conn.Close()
+			continue
+		}
+		c.conns[conn] = struct{}{}
+		c.mu.Unlock()
 		c.BaseCollector.GetWG().Add(1)
 		go c.handleConn(conn)
 	}
 }
 
-// handleConn обрабатывает одно Telnet-подключение.
 func (c *Collector) handleConn(conn net.Conn) {
 	defer c.BaseCollector.GetWG().Done()
 	defer c.BaseCollector.ReleaseConn()
-	defer conn.Close()
-
-	remoteAddr := conn.RemoteAddr().String()
-	host, port, _ := net.SplitHostPort(remoteAddr)
-
-	// Генерируем уникальный ID сессии.
-	sessionID := fmt.Sprintf("%x", time.Now().UnixNano())
-
-	// Создаём сессию в Session Manager.
-	_, err := c.BaseCollector.Sessions.CreateSession(
-		sessionID, host, "telnet", mustAtoi(port),
-	)
-	if err != nil {
-		c.log.Error("telnet create session failed", "session_id", sessionID, "error", err)
+	defer func() { c.mu.Lock(); delete(c.conns, conn); c.mu.Unlock(); _ = conn.Close() }()
+	host, port, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	sid := protocols.NewSessionID("telnet")
+	if _, err := c.Sessions.CreateSession(sid, host, "telnet", mustAtoi(port)); err != nil {
+		c.log.Warn("telnet create session failed", "error", err)
 		return
 	}
-
-	// Публикуем событие connect.
-	c.publishEvent(sessionID, host, port, "telnet", "telnet", event.EventTypeConnect, nil, event.SeverityLow)
-
-	// Настраиваем таймауты.
-	conn.SetDeadline(time.Now().Add(c.cfg.LoginTimeout))
-	defer conn.SetDeadline(time.Time{})
-
-	// Отправляем баннер.
-	banner := c.cfg.Banner
-	if banner == "" {
-		banner = "DARKSCOPE Telnet Service"
+	defer func() {
+		_ = c.Sessions.EndSession(sid)
+		c.publishEvent(sid, host, port, event.EventTypeDisconnect, nil, event.SeverityLow)
+	}()
+	c.publishEvent(sid, host, port, event.EventTypeConnect, nil, event.SeverityLow)
+	loginDeadline := time.Now().Add(c.cfg.LoginTimeout)
+	r := bufio.NewReader(conn)
+	write := func(s string) error {
+		_ = conn.SetWriteDeadline(time.Now().Add(c.cfg.WriteTimeout))
+		_, err := io.WriteString(conn, s)
+		return err
 	}
-	fmt.Fprintf(conn, "%s\r\n", banner)
-
-	reader := bufio.NewReader(conn)
-
-	// Эмуляция login prompt.
-	fmt.Fprint(conn, "login: ")
-	username, err := readLine(reader)
-	if err != nil {
-		c.log.Warn("telnet read username failed", "session_id", sessionID, "error", err)
-		c.BaseCollector.Sessions.EndSession(sessionID)
-		c.publishEvent(sessionID, host, port, "telnet", "telnet", event.EventTypeDisconnect, nil, event.SeverityLow)
-		return
-	}
-	username = strings.TrimSpace(username)
-
-	// Регистрируем попытку входа.
-	c.BaseCollector.Sessions.RecordLoginAttempt(sessionID)
-	c.publishEvent(sessionID, host, port, "telnet", "telnet", event.EventTypeLoginAttempt, map[string]interface{}{
-		"username": username,
-		"result":   "pending",
-	}, event.SeverityMedium)
-
-	// Эмуляция password prompt.
-	fmt.Fprint(conn, "Password: ")
-	password, err := readLine(reader)
-	if err != nil {
-		c.log.Warn("telnet read password failed", "session_id", sessionID, "error", err)
-		c.BaseCollector.Sessions.EndSession(sessionID)
-		c.publishEvent(sessionID, host, port, "telnet", "telnet", event.EventTypeDisconnect, nil, event.SeverityLow)
-		return
-	}
-	password = strings.TrimSpace(password)
-
-	// Обновляем событие login_attempt с результатом.
-	c.publishEvent(sessionID, host, port, "telnet", "telnet", event.EventTypeLoginAttempt, map[string]interface{}{
-		"username": username,
-		"password": "***",
-		"result":   "accepted",
-	}, event.SeverityMedium)
-
-	// Имитация успешного входа.
-	fmt.Fprintf(conn, "\r\nWelcome, %s. Type 'help' for available commands.\r\n", username)
-	c.publishEvent(sessionID, host, port, "telnet", "telnet", event.EventTypeLoginSuccess, map[string]interface{}{
-		"username": username,
-	}, event.SeverityHigh)
-
-	// Основной цикл чтения команд.
-	for {
-		conn.SetDeadline(time.Now().Add(c.cfg.IdleTimeout))
-		fmt.Fprint(conn, "> ")
-		line, err := readLine(reader)
-		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				c.log.Debug("telnet client disconnected", "session_id", sessionID)
-			} else {
-				c.log.Warn("telnet read error", "session_id", sessionID, "error", err)
-			}
-			break
+	read := func() (string, error) {
+		deadline := time.Now().Add(c.cfg.ReadTimeout)
+		if loginDeadline.Before(deadline) {
+			deadline = loginDeadline
 		}
-		line = strings.TrimSpace(line)
-		if line == "" {
+		_ = conn.SetReadDeadline(deadline)
+		return readTelnetLine(r, maxInputLine)
+	}
+	if err := write(sanitizeLine(c.cfg.Banner) + "\r\nlogin: "); err != nil {
+		return
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		user, err := read()
+		if err != nil {
+			return
+		}
+		user = strings.TrimSpace(user)
+		if err := write("Password: "); err != nil {
+			return
+		}
+		pass, err := read()
+		if err != nil {
+			return
+		}
+		_ = c.Sessions.RecordLoginAttempt(sid)
+		c.publishEvent(sid, host, port, event.EventTypeLoginAttempt, map[string]interface{}{
+			"username": user, "password": "***", "password_length": len(strings.TrimSpace(pass)), "attempt": attempt + 1, "result": "rejected",
+		}, event.SeverityMedium)
+		if err := write("Login incorrect\r\nlogin: "); err != nil {
+			return
+		}
+	}
+	_ = write("Too many attempts.\r\n")
+}
+
+// readTelnetLine bounds input and removes Telnet IAC negotiation sequences.
+func readTelnetLine(r *bufio.Reader, limit int) (string, error) {
+	line := make([]byte, 0, limit)
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if b == 255 { // IAC: discard negotiation and subnegotiation data
+			cmd, e := r.ReadByte()
+			if e != nil {
+				return "", e
+			}
+			if cmd == 250 { // SB option ... IAC SE
+				if _, e = r.ReadByte(); e != nil {
+					return "", e
+				}
+				for {
+					v, readErr := r.ReadByte()
+					if readErr != nil {
+						return "", readErr
+					}
+					if v == 255 {
+						next, readErr := r.ReadByte()
+						if readErr != nil {
+							return "", readErr
+						}
+						if next == 240 {
+							break
+						}
+					}
+				}
+			} else if cmd >= 251 && cmd <= 254 {
+				if _, e = r.ReadByte(); e != nil {
+					return "", e
+				}
+			}
 			continue
 		}
-
-		// Регистрируем команду как событие.
-		c.BaseCollector.Sessions.RecordCommand(sessionID)
-		c.publishEvent(sessionID, host, port, "telnet", "telnet", event.EventTypeCommand, map[string]interface{}{
-			"command": line,
-		}, event.SeverityLow)
-
-		// Обрабатываем встроенные команды (имитация).
-		response := handleTelnetCommand(line)
-		fmt.Fprintf(conn, "%s\r\n", response)
-
-		if line == "exit" || line == "quit" || line == "logout" {
-			break
+		if b == '\n' {
+			return strings.TrimRight(string(line), "\r"), nil
 		}
-	}
-
-	// Завершаем сессию.
-	c.BaseCollector.Sessions.EndSession(sessionID)
-	c.publishEvent(sessionID, host, port, "telnet", "telnet", event.EventTypeDisconnect, nil, event.SeverityLow)
-}
-
-// readLine читает одну строку от клиента.
-func readLine(reader *bufio.Reader) (string, error) {
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return "", err
-	}
-	return line, nil
-}
-
-// handleTelnetCommand обрабатывает встроенные команды telnet (имитация).
-func handleTelnetCommand(cmd string) string {
-	switch strings.ToLower(cmd) {
-	case "help":
-		return "Available commands: whoami, id, uname, hostname, pwd, ls, ps, exit"
-	case "whoami":
-		return "fakeuser"
-	case "id":
-		return "uid=1000(fakeuser) gid=1000(fakeuser) groups=1000(fakeuser)"
-	case "uname":
-		return "Linux darkscope 5.10.0-fake #1 SMP x86_64 GNU/Linux"
-	case "hostname":
-		return "darkscope"
-	case "pwd":
-		return "/home/fakeuser"
-	case "ls":
-		return "bin  boot  dev  etc  home  lib  lib64  media  mnt  opt  proc  root  run  sbin  srv  sys  tmp  usr  var"
-	case "ps":
-		return "  PID TTY          TIME CMD\n    1 ?        00:00:00 init\n    2 ?        00:00:00 kthreadd"
-	case "exit", "quit", "logout":
-		return "Goodbye."
-	default:
-		return fmt.Sprintf("%s: command not found", cmd)
+		if len(line) >= limit {
+			return "", errors.New("telnet input line too long")
+		}
+		line = append(line, b)
 	}
 }
 
-// Stop инициирует graceful shutdown Telnet Collectора.
+func sanitizeLine(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == 0 {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 func (c *Collector) Stop(ctx context.Context) error {
 	if !atomic.CompareAndSwapInt32(c.BaseCollector.GetRunning(), 1, 0) {
-		return nil // уже остановлен
+		return nil
 	}
-
 	if cancel := c.BaseCollector.GetCancel(); cancel != nil {
 		cancel()
 	}
-
 	if c.listener != nil {
-		c.listener.Close()
+		_ = c.listener.Close()
 	}
-
+	c.mu.Lock()
+	for conn := range c.conns {
+		_ = conn.Close()
+	}
+	c.mu.Unlock()
 	done := make(chan struct{})
-	go func() {
-		c.BaseCollector.GetWG().Wait()
-		close(done)
-	}()
-
+	go func() { c.BaseCollector.GetWG().Wait(); close(done) }()
 	select {
 	case <-done:
 		return nil
@@ -275,9 +250,16 @@ func (c *Collector) Stop(ctx context.Context) error {
 	}
 }
 
-// mustAtoi конвертирует строку в int.
+func (c *Collector) publishEvent(sid, ip, srcPort string, typ event.EventType, payload interface{}, severity event.Severity) {
+	ev := event.NewEvent(sid, ip, "127.0.0.1", mustAtoi(srcPort), 23, "telnet", "telnet", typ, payload)
+	ev.WithSeverity(severity).WithConfidence(0.9)
+	if err := c.publisher.Publish(ev); err != nil {
+		c.log.Warn("telnet publish event failed", "error", err)
+	}
+}
+
 func mustAtoi(s string) int {
-	var n int
+	n := 0
 	for _, ch := range s {
 		if ch < '0' || ch > '9' {
 			return 0
@@ -286,18 +268,3 @@ func mustAtoi(s string) int {
 	}
 	return n
 }
-
-// publishEvent публикует событие в Event Bus.
-func (c *Collector) publishEvent(sessionID, sourceIP, sourcePort, protocol, service string, et event.EventType, payload interface{}, severity event.Severity) {
-	ev := event.NewEvent(sessionID, sourceIP, "127.0.0.1", mustAtoi(sourcePort), 23, protocol, service, et, payload)
-	ev.WithSeverity(severity).WithConfidence(0.9)
-	if err := c.publisher.Publish(ev); err != nil {
-		c.log.Warn("telnet publish event failed", "error", err)
-	}
-}
-
-var (
-	_ = context.Background
-	_ = sync.WaitGroup{}
-	_ = time.Second
-)
