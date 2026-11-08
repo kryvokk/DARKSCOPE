@@ -128,7 +128,7 @@ func (e *Emulator) Execute(line string) Result {
 		result.Out = result.Out[:MaxOutputBytes]
 	}
 	if e.publisher != nil {
-		e.publisher.PublishCommand(e.SessionID, line, result.Out, result.Honeytoken)
+		e.publisher.PublishCommand(e.SessionID, line, result.Out+result.Err, result.Honeytoken)
 	}
 	return result
 }
@@ -163,6 +163,8 @@ func (e *Emulator) execute(a []string) Result {
 		return Result{Out: "uid=1000(user) gid=1000(user) groups=1000(user)\n"}
 	case "date":
 		return Result{Out: "Sun Nov  8 00:00:00 UTC 2026\n"}
+	case "uptime":
+		return Result{Out: " 00:12:34 up 3 days,  4:21,  1 user,  load average: 0.02, 0.01, 0.00\n"}
 	case "echo", "printf":
 		return Result{Out: strings.Join(args, " ") + map[bool]string{true: "", false: "\n"}[cmd == "printf"]}
 	case "help", "man":
@@ -177,6 +179,20 @@ func (e *Emulator) execute(a []string) Result {
 		p := "."
 		if len(args) > 0 {
 			p = args[len(args)-1]
+		}
+		if cmd == "tree" {
+			root, er := e.FS.Resolve(p, e.Cwd)
+			if er != nil {
+				return fail(er)
+			}
+			var b strings.Builder
+			fmt.Fprintln(&b, root)
+			for _, node := range e.FS.Paths() {
+				if node != root && strings.HasPrefix(node, strings.TrimSuffix(root, "/")+"/") {
+					fmt.Fprintln(&b, node)
+				}
+			}
+			return Result{Out: b.String()}
 		}
 		names, err := e.FS.List(p, e.Cwd)
 		if err != nil {
