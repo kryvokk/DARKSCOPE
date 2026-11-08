@@ -9,9 +9,9 @@ import (
 
 // Ошибки шины события.
 var (
-	ErrBusStopped      = errors.New("event bus is stopped")
-	ErrQueueFull       = errors.New("event queue is full")
-	ErrAlreadyStarted  = errors.New("event bus already started")
+	ErrBusStopped     = errors.New("event bus is stopped")
+	ErrQueueFull      = errors.New("event queue is full")
+	ErrAlreadyStarted = errors.New("event bus already started")
 )
 
 // Processor обрабатывает событие. nil означает "подсчитать как доставленное".
@@ -40,7 +40,8 @@ type Metrics struct {
 // (Storage, Detection, Alert) через отдельные буферизированные каналы.
 // События не konkurрируют за одну общую очередь — у каждого подписчика своя.
 type EventBus struct {
-	in chan *Event
+	publishMu sync.RWMutex // linearizes Publish against Stop
+	in        chan *Event
 
 	storageChan   chan *Event
 	detectionChan chan *Event
@@ -53,9 +54,9 @@ type EventBus struct {
 	stopped atomic.Bool
 
 	// Процессоры (могут быть nil — тогда событие только считается доставленным)
-	storageProc  Processor
+	storageProc   Processor
 	detectionProc Processor
-	alertProc    Processor
+	alertProc     Processor
 
 	// Метрики (atomic)
 	publishedTotal     uint64
@@ -78,11 +79,11 @@ func New(bufferSize int) *EventBus {
 		bufferSize = 1000
 	}
 	return &EventBus{
-		in:               make(chan *Event, bufferSize),
-		storageChan:      make(chan *Event, bufferSize),
-		detectionChan:    make(chan *Event, bufferSize),
-		alertChan:        make(chan *Event, bufferSize),
-		stopCh:           make(chan struct{}),
+		in:            make(chan *Event, bufferSize),
+		storageChan:   make(chan *Event, bufferSize),
+		detectionChan: make(chan *Event, bufferSize),
+		alertChan:     make(chan *Event, bufferSize),
+		stopCh:        make(chan struct{}),
 	}
 }
 
@@ -128,6 +129,8 @@ func (b *EventBus) Start(ctx context.Context) error {
 // входной очереди событие отбрасывается и возвращается ErrQueueFull.
 // После остановки шины возвращает ErrBusStopped.
 func (b *EventBus) Publish(ev *Event) error {
+	b.publishMu.RLock()
+	defer b.publishMu.RUnlock()
 	if b.stopped.Load() {
 		return ErrBusStopped
 	}
@@ -217,10 +220,13 @@ func (b *EventBus) worker(ch <-chan *Event, proc Processor, processed, dropped, 
 // 2. дренит очереди (дочитывает все события из in),
 // 3. ждет завершения всех обработчиков с таймаутом.
 func (b *EventBus) Stop(ctx context.Context) error {
+	b.publishMu.Lock()
 	if !b.stopped.CompareAndSwap(false, true) {
+		b.publishMu.Unlock()
 		return nil // уже остановлен
 	}
 	close(b.stopCh)
+	b.publishMu.Unlock()
 	// in не закрывается здесь — диспетчер дочитает его и сам завершится.
 
 	done := make(chan struct{})
@@ -240,11 +246,11 @@ func (b *EventBus) Stop(ctx context.Context) error {
 // Metrics возвращает текущие счетчики и длины очередей (моментальный снимок).
 func (b *EventBus) Metrics() Metrics {
 	return Metrics{
-		PublishedTotal:    atomic.LoadUint64(&b.publishedTotal),
-		DroppedTotal:      atomic.LoadUint64(&b.droppedTotal),
-		StorageProcessed:  atomic.LoadUint64(&b.storageProcessed),
-		StorageDropped:    atomic.LoadUint64(&b.storageDropped),
-		StorageErrors:     atomic.LoadUint64(&b.storageErrors),
+		PublishedTotal:     atomic.LoadUint64(&b.publishedTotal),
+		DroppedTotal:       atomic.LoadUint64(&b.droppedTotal),
+		StorageProcessed:   atomic.LoadUint64(&b.storageProcessed),
+		StorageDropped:     atomic.LoadUint64(&b.storageDropped),
+		StorageErrors:      atomic.LoadUint64(&b.storageErrors),
 		DetectionProcessed: atomic.LoadUint64(&b.detectionProcessed),
 		DetectionDropped:   atomic.LoadUint64(&b.detectionDropped),
 		DetectionErrors:    atomic.LoadUint64(&b.detectionErrors),

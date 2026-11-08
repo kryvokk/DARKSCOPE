@@ -66,9 +66,18 @@ func TestEventBusOverflowDoesNotBlock(t *testing.T) {
 	detectionCh := make(chan *Event, 1)
 	alertCh := make(chan *Event, 1)
 	// Читаем из каналов в фоне, чтобы процессоры не блокировались на отправке.
-	go func() { for range storageCh {} }()
-	go func() { for range detectionCh {} }()
-	go func() { for range alertCh {} }()
+	go func() {
+		for range storageCh {
+		}
+	}()
+	go func() {
+		for range detectionCh {
+		}
+	}()
+	go func() {
+		for range alertCh {
+		}
+	}()
 	b.SetProcessors(
 		func(e *Event) error { storageCh <- e; return nil },
 		func(e *Event) error { detectionCh <- e; return nil },
@@ -135,8 +144,8 @@ func TestEventBusConcurrentPublishAndStop(t *testing.T) {
 		t.Fatalf("stop: %v", err)
 	}
 	<-done
-	if got := atomic.LoadInt64(&processed); got == 0 {
-		t.Error("expected at least some events processed")
+	if got, accepted, downstreamDropped := atomic.LoadInt64(&processed), atomic.LoadInt64(&published), b.Metrics().StorageDropped; uint64(got)+downstreamDropped != uint64(accepted) {
+		t.Errorf("processed %d + explicitly dropped %d, want accepted publications %d", got, downstreamDropped, accepted)
 	}
 	if b.IsStopped() != true {
 		t.Error("bus should be stopped")
