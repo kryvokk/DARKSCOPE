@@ -12,15 +12,16 @@ var ValidSeverities = map[Severity]struct{}{
 
 // ValidEventTypes — допустимые типы событий.
 var ValidEventTypes = map[EventType]struct{}{
-	EventTypeConnect:         {},
-	EventTypeDisconnect:      {},
-	EventTypeLoginAttempt:    {},
-	EventTypeLoginSuccess:    {},
-	EventTypeCommand:         {},
-	EventTypeRequest:         {},
-	EventTypeFileUpload:      {},
-	EventTypeHoneytokenAccess: {},
+	EventTypeConnect:            {},
+	EventTypeDisconnect:         {},
+	EventTypeLoginAttempt:       {},
+	EventTypeLoginSuccess:       {},
+	EventTypeCommand:            {},
+	EventTypeRequest:            {},
+	EventTypeFileUpload:         {},
+	EventTypeHoneytokenAccess:   {},
 	EventTypeSuspiciousActivity: {},
+	EventTypeProtocolError:      {},
 }
 
 // IsValid проверяет корректность полей события.

@@ -12,15 +12,16 @@ import (
 type EventType string
 
 const (
-	EventTypeConnect         EventType = "connect"
-	EventTypeDisconnect      EventType = "disconnect"
-	EventTypeLoginAttempt    EventType = "login_attempt"
-	EventTypeLoginSuccess    EventType = "login_success"
-	EventTypeCommand         EventType = "command"
-	EventTypeRequest         EventType = "request"
-	EventTypeFileUpload      EventType = "file_upload"
-	EventTypeHoneytokenAccess EventType = "honeytoken_access"
-	EventTypeSuspiciousActivity EventType = "suspicious_activity"
+	EventTypeConnect             EventType = "connect"
+	EventTypeDisconnect          EventType = "disconnect"
+	EventTypeLoginAttempt        EventType = "login_attempt"
+	EventTypeLoginSuccess        EventType = "login_success"
+	EventTypeCommand             EventType = "command"
+	EventTypeRequest             EventType = "request"
+	EventTypeFileUpload          EventType = "file_upload"
+	EventTypeHoneytokenAccess    EventType = "honeytoken_access"
+	EventTypeSuspiciousActivity  EventType = "suspicious_activity"
+	EventTypeProtocolError       EventType = "protocol_error"
 )
 
 // Severity — уровень серьезности события.

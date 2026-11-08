@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -101,7 +102,11 @@ func TestSSHCollectorConnectionAndEvents(t *testing.T) {
 	if err := coll.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer coll.Stop(context.Background())
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		_ = coll.Stop(stopCtx)
+	}()
 
 	addr := coll.ListenAddr()
 
@@ -174,7 +179,11 @@ func TestSSHCollectorConcurrentConnections(t *testing.T) {
 	if err := coll.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer coll.Stop(context.Background())
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		_ = coll.Stop(stopCtx)
+	}()
 
 	addr := coll.ListenAddr()
 	var wg sync.WaitGroup
@@ -196,6 +205,249 @@ func TestSSHCollectorConcurrentConnections(t *testing.T) {
 
 	if got := atomic.LoadInt64(&connected); got < 5 {
 		t.Errorf("expected at least 5 connections, got %d", got)
+	}
+}
+
+// stopCollector останавливает коллектор с ограниченным по времени контекстом.
+func stopCollector(t *testing.T, coll *Collector, d time.Duration) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	return coll.Stop(ctx)
+}
+
+// TestSSHAuthCapture проверяет захват username/длины пароля и версий в событиях.
+func TestSSHAuthCapture(t *testing.T) {
+	cfg := &config.SSHConfig{
+		Enabled:        true,
+		ListenAddress:  "127.0.0.1:0",
+		AuthTimeout:    5 * time.Second,
+		MaxConnections: 10,
+		Banner:         "SSH-2.0-test",
+	}
+	capture := &captureProcessor{}
+	sessMgr := session.NewManager()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	coll, err := New(cfg, capture, sessMgr, logger)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := coll.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = stopCollector(t, coll, 5*time.Second) }()
+
+	addr := coll.ListenAddr()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, &ssh.ClientConfig{
+		User:            "root",
+		Auth:            []ssh.AuthMethod{ssh.Password("toor1234")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("ssh client handshake: %v", err)
+	}
+	sshConn.Close()
+	go ssh.DiscardRequests(reqs)
+	for range chans {
+	}
+
+	// Ожидание доставки событий capture-процессору.
+	deadline := time.Now().Add(3 * time.Second)
+	var events []*event.Event
+	for time.Now().Before(deadline) {
+		events = capture.Events()
+		if len(events) >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	events = capture.Events()
+	var loginAttempt, loginSuccess, connect *event.Event
+	for _, ev := range events {
+		switch ev.EventType {
+		case event.EventTypeConnect:
+			if connect == nil {
+				connect = ev
+			}
+		case event.EventTypeLoginAttempt:
+			if loginAttempt == nil {
+				loginAttempt = ev
+			}
+		case event.EventTypeLoginSuccess:
+			if loginSuccess == nil {
+				loginSuccess = ev
+			}
+		}
+	}
+
+	if connect == nil {
+		t.Fatal("expected connect event")
+	}
+	if cv, ok := connect.Metadata["client_version"].(string); !ok || cv == "" {
+		t.Errorf("connect event must have client_version metadata, got %v", connect.Metadata)
+	}
+
+	if loginAttempt == nil {
+		t.Fatal("expected login_attempt event")
+	}
+	if got := loginAttempt.Payload.(map[string]interface{})["user"]; got != "root" {
+		t.Errorf("login_attempt user = %v, want root", got)
+	}
+	if got := loginAttempt.Payload.(map[string]interface{})["password_length"]; got != len("toor1234") {
+		t.Errorf("login_attempt password_length = %v, want %d", got, len("toor1234"))
+	}
+	if got := loginAttempt.Payload.(map[string]interface{})["password"]; got != "***" {
+		t.Errorf("password must be masked, got %v", got)
+	}
+
+	if loginSuccess == nil {
+		t.Fatal("expected login_success event")
+	}
+	if got := loginSuccess.Payload.(map[string]interface{})["user"]; got != "root" {
+		t.Errorf("login_success user = %v, want root", got)
+	}
+}
+
+// TestSSHStopClosesActiveConnections проверяет, что Stop завершает
+// соединение с активным SSH-сеансом за ограниченное время.
+func TestSSHStopClosesActiveConnections(t *testing.T) {
+	cfg := &config.SSHConfig{
+		Enabled:        true,
+		ListenAddress:  "127.0.0.1:0",
+		AuthTimeout:    10 * time.Second,
+		MaxConnections: 10,
+		Banner:         "SSH-2.0-test",
+	}
+	capture := &captureProcessor{}
+	sessMgr := session.NewManager()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	coll, err := New(cfg, capture, sessMgr, logger)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := coll.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	addr := coll.ListenAddr()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	sshConn, _, _, err := ssh.NewClientConn(conn, addr, &ssh.ClientConfig{
+		User:            "user",
+		Auth:            []ssh.AuthMethod{ssh.Password("pass")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("ssh client handshake: %v", err)
+	}
+	defer sshConn.Close()
+
+	// Stop обязан принудительно закрыть живое соединение и дождаться
+	// обработчика — без этого он упёрся бы в AuthTimeout (10 c).
+	start := time.Now()
+	if err := stopCollector(t, coll, 3*time.Second); err != nil {
+		t.Fatalf("Stop with active connection: %v (elapsed %s)", err, time.Since(start))
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("Stop took too long: %s", elapsed)
+	}
+}
+
+// TestSSHHandshakeGarbage проверяет публикацию protocol_error
+// при некорректном поведении клиента до SSH-handshake.
+func TestSSHHandshakeGarbage(t *testing.T) {
+	cfg := &config.SSHConfig{
+		Enabled:        true,
+		ListenAddress:  "127.0.0.1:0",
+		AuthTimeout:    5 * time.Second,
+		MaxConnections: 10,
+		Banner:         "SSH-2.0-test",
+	}
+	capture := &captureProcessor{}
+	sessMgr := session.NewManager()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	coll, err := New(cfg, capture, sessMgr, logger)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := coll.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = stopCollector(t, coll, 5*time.Second) }()
+
+	addr := coll.ListenAddr()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	// Отправляем мусор вместо строки версии SSH.
+	_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+	time.Sleep(100 * time.Millisecond)
+	conn.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	found := false
+	for time.Now().Before(deadline) && !found {
+		for _, ev := range capture.Events() {
+			if ev.EventType == event.EventTypeProtocolError {
+				found = true
+				break
+			}
+		}
+		if !found {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if !found {
+		t.Error("expected protocol_error event on garbage handshake")
+	}
+}
+
+// TestSanitizeServerVersion проверяет валидацию SSH-баннера.
+func TestSanitizeServerVersion(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "SSH-2.0-DARKSCOPE"},
+		{"SSH-2.0-Custom", "SSH-2.0-Custom"},
+		{"SSH-1.99-old", "SSH-1.99-old"},
+		{"invalid-banner", "SSH-2.0-DARKSCOPE"},
+		{"SSH-2.0-bad\r\nInject", "SSH-2.0-DARKSCOPE"},
+		{"SSH-2.0-" + strings.Repeat("x", 100), "SSH-2.0-DARKSCOPE"},
+	}
+	for _, tc := range cases {
+		if got := sanitizeServerVersion(tc.in); got != tc.want {
+			t.Errorf("sanitizeServerVersion(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

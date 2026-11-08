@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -23,12 +24,14 @@ import (
 	"darkscope/honeypot/internal/session"
 )
 
-// authAttempt хранит данные последней попытки аутентификации для соединения.
+// authAttempt хранит данные попытки аутентификации для одного соединения.
+// Пароль не сохраняется в событиях — фиксируются username и длина пароля.
 type authAttempt struct {
-	mu     sync.Mutex
-	user   string
-	pass   string
-	result string // "pending" | "success" | "failure"
+	mu         sync.Mutex
+	user       string
+	passLen    int
+	clientVer  string
+	result     string // "pending" | "accepted"
 }
 
 // Collector реализует SSH Honeypot.
@@ -38,6 +41,8 @@ type Collector struct {
 	log         *slog.Logger
 	authMu      sync.Mutex
 	authMap     map[string]*authAttempt
+	connsMu     sync.Mutex
+	conns       map[net.Conn]struct{} // живые соединения для форс-закрытия на Stop
 	listener    net.Listener
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -71,22 +76,37 @@ func New(cfg *config.SSHConfig, publisher protocols.Publisher, sessMgr *session.
 		}
 	}
 
+	// Honeypot принимает любую парольную аутентификацию: реальные креды
+	// не проверяются, доступа к ОС не существует. Попытка фиксируется для
+	// последующего анализа (username, длина пароля, версия клиента).
+	c := &Collector{
+		cfg:       cfg,
+		authMap:   make(map[string]*authAttempt),
+		conns:     make(map[net.Conn]struct{}),
+		log:       log,
+		publisher: publisher,
+		sessions:  sessMgr,
+	}
+
 	serverCfg := &ssh.ServerConfig{
 		ServerVersion: sanitizeServerVersion(cfg.Banner),
-		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			return &ssh.Permissions{}, nil
-		},
 	}
+	c.serverCfg = serverCfg
 	serverCfg.AddHostKey(hostKey)
 
-	c := &Collector{
-		cfg:         cfg,
-		serverCfg:   serverCfg,
-		authMap:     make(map[string]*authAttempt),
-		log:         log,
-		publisher:   publisher,
-		sessions:    sessMgr,
+	serverCfg.PasswordCallback = func(cm ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+		ra := cm.RemoteAddr().String()
+		c.authMu.Lock()
+		c.authMap[ra] = &authAttempt{
+			user:      cm.User(),
+			passLen:   len(pass),
+			clientVer: string(cm.ClientVersion()),
+			result:    "accepted",
+		}
+		c.authMu.Unlock()
+		return &ssh.Permissions{}, nil
 	}
+
 	if cfg.MaxConnections > 0 {
 		c.connLimiter = make(chan struct{}, cfg.MaxConnections)
 	}
@@ -128,6 +148,10 @@ func (c *Collector) Start(ctx context.Context) error {
 }
 
 // acceptLoop принимает входящие TCP-подключения.
+// Каждое принятое соединение регистрируется в c.conns до запуска обработчика:
+// Stop всегда может их форс-закрыть. Регистрация под mutex с проверкой
+// running исключает race: после старта остановки новые соединения не
+// попадают в карту, а сразу закрываются.
 func (c *Collector) acceptLoop() {
 	defer c.wg.Done()
 
@@ -144,6 +168,21 @@ func (c *Collector) acceptLoop() {
 		if !c.acquireConn() {
 			c.log.Warn("ssh connection limit reached, rejecting", "remote", conn.RemoteAddr())
 			conn.Close()
+			continue
+		}
+
+		registered := false
+		c.connsMu.Lock()
+		if atomic.LoadInt32(&c.running) == 1 {
+			c.conns[conn] = struct{}{}
+			registered = true
+		}
+		c.connsMu.Unlock()
+
+		if !registered {
+			// Остановка началась между Accept и регистрацией.
+			conn.Close()
+			c.releaseConn()
 			continue
 		}
 
@@ -178,13 +217,17 @@ func (c *Collector) handleConn(conn net.Conn) {
 	defer c.wg.Done()
 	defer c.releaseConn()
 	defer conn.Close()
+	defer func() {
+		c.connsMu.Lock()
+		delete(c.conns, conn)
+		c.connsMu.Unlock()
+	}()
 
 	remoteAddr := conn.RemoteAddr().String()
 	host, port, _ := net.SplitHostPort(remoteAddr)
 
-	c.authMu.Lock()
-	c.authMap[remoteAddr] = &authAttempt{result: "pending"}
-	c.authMu.Unlock()
+	// Запись из authMap удаляется при завершении соединения, чтобы карта
+	// не росла неограниченно в течение жизни процесса.
 	defer func() {
 		c.authMu.Lock()
 		delete(c.authMap, remoteAddr)
@@ -198,10 +241,34 @@ func (c *Collector) handleConn(conn net.Conn) {
 	if err != nil {
 		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			c.log.Warn("ssh handshake failed", "remote", remoteAddr, "error", err)
+			// Некорректное поведение клиента на уровне протокола —
+			// отдельное событие; обычный EOF сканирования не фиксируем.
+			c.publishEvent(ephemeralSessionID("ssh-handshake"), host, port, "ssh", "ssh",
+				event.EventTypeProtocolError, map[string]interface{}{
+					"stage":          "handshake",
+					"reason":         err.Error(),
+					"client_version": clientBanner(conn),
+				}, event.SeverityLow)
 		}
 		return
 	}
 	defer sshConn.Close()
+
+	// После успешного handshake ограничение AuthTimeout снято: сессия имеет
+	// право на интерактивное использование; остановка контролируется через
+	// Stop (форс-закрытие живых соединений).
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		c.log.Debug("ssh deadline reset failed", "remote", remoteAddr, "error", err)
+	}
+
+	// Данные последней попытки аутентификации этого соединения,
+	// записанные PasswordCallback при handshake.
+	var att *authAttempt
+	c.authMu.Lock()
+	if a, ok := c.authMap[remoteAddr]; ok {
+		att = a
+	}
+	c.authMu.Unlock()
 
 	sessionID := fmt.Sprintf("%x", sshConn.SessionID())
 
@@ -213,16 +280,35 @@ func (c *Collector) handleConn(conn net.Conn) {
 		return
 	}
 
-	c.publishEvent(sessionID, host, port, "ssh", "ssh", event.EventTypeConnect, nil, event.SeverityLow)
+	// Событие подключения; версии клиента и сервера — в метаданных.
+	c.publishEvent(sessionID, host, port, "ssh", "ssh", event.EventTypeConnect, nil, event.SeverityLow,
+		func(e *event.Event) {
+			e.WithMetadata("client_version", string(sshConn.ClientVersion())).
+				WithMetadata("server_version", string(sshConn.ServerVersion()))
+		})
+
+	// Попытка аутентификации: honeypot принимает любой пароль, реальные
+	// креды не проверяются, пароль в событие не пишется (только длина).
+	user := ""
+	passLen := 0
+	if att != nil {
+		att.mu.Lock()
+		user, passLen = att.user, att.passLen
+		att.mu.Unlock()
+	}
 
 	c.sessions.RecordLoginAttempt(sessionID)
 	c.publishEvent(sessionID, host, port, "ssh", "ssh", event.EventTypeLoginAttempt, map[string]interface{}{
-		"method": "password",
-		"result": "accepted",
+		"method":          "password",
+		"user":            user,
+		"password":        "***",
+		"password_length": passLen,
+		"result":          "accepted",
 	}, event.SeverityMedium)
 
 	c.publishEvent(sessionID, host, port, "ssh", "ssh", event.EventTypeLoginSuccess, map[string]interface{}{
 		"method": "password",
+		"user":   user,
 	}, event.SeverityHigh)
 
 	go ssh.DiscardRequests(reqs)
@@ -244,21 +330,70 @@ func (c *Collector) handleChannel(newChannel ssh.NewChannel, sessionID, host, po
 	channelType := newChannel.ChannelType()
 	c.log.Debug("ssh channel opened", "session_id", sessionID, "channel_type", channelType)
 
+	// Реальный shell не предоставляется: попытка открытия канала
+	// фиксируется и отклоняется. Каналы не выполняют команды хоста.
 	newChannel.Reject(ssh.Prohibited, "channel not supported")
 
 	c.sessions.RecordCommand(sessionID)
 	c.publishEvent(sessionID, host, port, "ssh", "ssh", event.EventTypeCommand, map[string]interface{}{
 		"channel_type": channelType,
 		"action":       "channel_rejected",
-	}, event.SeverityLow)
+	}, event.SeverityLow, nil)
 }
 
-func (c *Collector) publishEvent(sessionID, sourceIP, sourcePort, protocol, service string, et event.EventType, payload interface{}, severity event.Severity) {
+// publishOption — необязательная донастройка события перед публикацией.
+type publishOption func(*event.Event)
+
+// publishEvent формирует нормализованное событие и публикует его через publisher.
+func (c *Collector) publishEvent(sessionID, sourceIP, sourcePort, protocol, service string,
+	et event.EventType, payload interface{}, severity event.Severity, opts ...publishOption) {
 	ev := event.NewEvent(sessionID, sourceIP, "127.0.0.1", mustAtoi(sourcePort), 22, protocol, service, et, payload)
 	ev.WithSeverity(severity).WithConfidence(0.9)
-	if err := c.publisher.Publish(ev); err != nil {
-		c.log.Warn("ssh publish event failed", "error", err)
+	for _, opt := range opts {
+		opt(ev)
 	}
+	c.publish(ev, string(et))
+}
+
+// publish отправляет готовое событие; ошибки публикации не прерывают
+// обработку соединения (ошибки шины не должны валить honeypot).
+func (c *Collector) publish(ev *event.Event, et string) {
+	if err := c.publisher.Publish(ev); err != nil {
+		c.log.Warn("ssh publish event failed", "event_type", et, "error", err)
+	}
+}
+
+// ephemeralSessionID генерирует временный ID для событий вне сессии
+// (например, отказ handshake до установления Session).
+func ephemeralSessionID(prefix string) string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		n := ephemIDSeq.Add(1)
+		binary.BigEndian.PutUint64(b[:], n)
+	}
+	return fmt.Sprintf("%s-%x", prefix, b)
+}
+
+var ephemIDSeq atomic.Uint64
+
+// clientBanner пытается получить версию клиента из необработанного потока
+// до handshake (первая строка, ограниченная по длине) — для диагностики.
+func clientBanner(conn net.Conn) string {
+	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	buf := make([]byte, 255)
+	n, err := conn.Read(buf)
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil && n == 0 {
+		return ""
+	}
+	line := string(buf[:n])
+	if i := strings.IndexAny(line, "\r\n"); i >= 0 {
+		line = line[:i]
+	}
+	if len(line) > 128 {
+		line = line[:128]
+	}
+	return line
 }
 
 func (c *Collector) IsRunning() bool {
@@ -277,6 +412,14 @@ func (c *Collector) Stop(ctx context.Context) error {
 	if c.listener != nil {
 		c.listener.Close()
 	}
+
+	// Форс-закрытие живых соединений: разблокирует sshConn.Wait()
+	// и гарантирует завершение обработчиков за ограниченное время.
+	c.connsMu.Lock()
+	for conn := range c.conns {
+		_ = conn.Close()
+	}
+	c.connsMu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
