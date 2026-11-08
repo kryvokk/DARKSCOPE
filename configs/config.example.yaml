@@ -1,0 +1,44 @@
+# DARKSCOPE Honeypot — пример конфигурации (config.example.yaml)
+# Секретные значения НЕ хранятся в этом файле. В конфиге указаны только имена
+# переменных окружения; фактические значения читаются из ENV при запуске.
+
+listen:
+  ssh: "0.0.0.0:2222"
+  http: "0.0.0.0:8080"
+  telnet: "0.0.0.0:2323"
+
+api:
+  listen: "127.0.0.1:9090"
+  authentication: true
+
+storage:
+  driver: sqlite
+  path: "./data/honeypot.db"
+  max_upload_size: 10485760
+  retention_days: 30
+
+event_bus:
+  buffer_size: 1000
+  workers: 4
+
+detection:
+  brute_force:
+    enabled: true
+    max_attempts: 20
+    window_seconds: 60
+  suspicious_commands: true
+
+alerts:
+  telegram:
+    enabled: false
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    chat_id_env: TELEGRAM_CHAT_ID
+  webhook:
+    enabled: false
+    url_env: WEBHOOK_URL
+
+security:
+  max_connections: 500
+  max_request_body: 1048576
+  enable_uploads: true
+  outbound_network: false
