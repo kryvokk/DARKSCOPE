@@ -1,7 +1,10 @@
 package app
 
 import (
+	"bufio"
 	"context"
+	"io"
+	"net"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -9,13 +12,18 @@ import (
 
 	"darkscope/honeypot/internal/config"
 	"darkscope/honeypot/internal/storage"
+	"golang.org/x/crypto/ssh"
 )
 
-func TestAppHTTPEventPipelineAndShutdown(t *testing.T) {
+func TestAppProtocolEventPipelineAndShutdown(t *testing.T) {
 	cfg := &config.Config{
-		Storage:   config.Storage{Path: filepath.Join(t.TempDir(), "events.db")},
-		EventBus:  config.EventBus{BufferSize: 128, Workers: 1},
-		Protocols: config.Protocols{HTTP: config.HTTPConfig{Enabled: true, ListenAddress: "127.0.0.1:0", MaxConnections: 8, ReadTimeout: time.Second, WriteTimeout: time.Second, IdleTimeout: time.Second, MaxBodySize: 1024}},
+		Storage:  config.Storage{Path: filepath.Join(t.TempDir(), "events.db")},
+		EventBus: config.EventBus{BufferSize: 128, Workers: 1},
+		Protocols: config.Protocols{
+			SSH:    config.SSHConfig{Enabled: true, ListenAddress: "127.0.0.1:0", MaxConnections: 8, AuthTimeout: 3 * time.Second},
+			HTTP:   config.HTTPConfig{Enabled: true, ListenAddress: "127.0.0.1:0", MaxConnections: 8, ReadTimeout: time.Second, WriteTimeout: time.Second, IdleTimeout: time.Second, MaxBodySize: 1024},
+			Telnet: config.TelnetConfig{Enabled: true, ListenAddress: "127.0.0.1:0", MaxConnections: 8, LoginTimeout: 3 * time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second},
+		},
 	}
 	a, err := New(cfg)
 	if err != nil {
@@ -24,26 +32,58 @@ func TestAppHTTPEventPipelineAndShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
-	var addr string
+	addrs := make(map[string]string)
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if a.collectors[0].IsRunning() {
-			addr = a.collectors[0].ListenAddr()
+		for _, collector := range a.collectors {
+			if collector.IsRunning() {
+				addrs[collector.Name()] = collector.ListenAddr()
+			}
+		}
+		if len(addrs) == 3 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if addr == "" {
+	if len(addrs) != 3 {
 		cancel()
-		t.Fatal("HTTP collector did not start")
+		t.Fatalf("collectors did not start: %v", addrs)
 	}
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://" + addr + "/login?probe=1")
+	resp, err := client.Get("http://" + addrs["http"] + "/login?probe=1")
 	if err != nil {
 		cancel()
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
+
+	sshConn, _, _, err := ssh.NewClientConn(mustDial(t, addrs["ssh"]), addrs["ssh"], &ssh.ClientConfig{
+		User: "audit", Auth: []ssh.AuthMethod{ssh.Password("secret")}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 2 * time.Second,
+	})
+	if err != nil {
+		cancel()
+		t.Fatalf("SSH handshake: %v", err)
+	}
+	_ = sshConn.Close()
+
+	telnetConn, err := net.DialTimeout("tcp", addrs["telnet"], 2*time.Second)
+	if err != nil {
+		cancel()
+		t.Fatalf("Telnet dial: %v", err)
+	}
+	_ = telnetConn.SetDeadline(time.Now().Add(2 * time.Second))
+	reader := bufio.NewReader(telnetConn)
+	if _, err = reader.ReadString(':'); err != nil {
+		cancel()
+		t.Fatalf("Telnet login prompt: %v", err)
+	}
+	_, _ = io.WriteString(telnetConn, "audit\r\n")
+	if _, err = reader.ReadString(':'); err != nil {
+		cancel()
+		t.Fatalf("Telnet password prompt: %v", err)
+	}
+	_, _ = io.WriteString(telnetConn, "secret\r\n")
+	_ = telnetConn.Close()
 	cancel()
 	select {
 	case err := <-done:
@@ -61,11 +101,29 @@ func TestAppHTTPEventPipelineAndShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	var count int
-	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM events WHERE protocol='http' AND event_type='request'`).Scan(&count); err != nil {
+	for _, protocol := range []string{"ssh", "http", "telnet"} {
+		var count int
+		if err := store.DB().QueryRow(`SELECT COUNT(*) FROM events WHERE protocol=?`, protocol).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count == 0 {
+			t.Fatalf("no %s events stored", protocol)
+		}
+	}
+	var requestCount int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM events WHERE protocol='http' AND event_type='request'`).Scan(&requestCount); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("stored request event count = %d, want 1", count)
+	if requestCount != 1 {
+		t.Fatalf("stored HTTP request events = %d, want 1", requestCount)
 	}
+}
+
+func mustDial(t *testing.T, address string) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
 }
