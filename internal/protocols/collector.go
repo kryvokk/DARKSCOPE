@@ -33,17 +33,27 @@ type CollectorConfig struct {
 
 // BaseCollector содержит общие поля и методы для всех сборщиков.
 type BaseCollector struct {
-	Name         string
-	ListenAddr   string
-	EventBus     *event.EventBus
-	Sessions     *session.Manager
-	Listener     net.Listener
+	name        string
+	listenAddr  string
+	EventBus    *event.EventBus
+	Sessions    *session.Manager
+	Listener    net.Listener
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	running int32
 	wg      sync.WaitGroup
 	connLimiter chan struct{}
+}
+
+// Name возвращает имя протокола сборщика.
+func (b *BaseCollector) Name() string {
+	return b.name
+}
+
+// ListenAddr возвращает адрес прослушивания сборщика.
+func (b *BaseCollector) ListenAddr() string {
+	return b.listenAddr
 }
 
 // SetContext устанавливает контекст и функцию отмены.
@@ -104,8 +114,6 @@ func (b *BaseCollector) IsRunning() bool {
 func (b *BaseCollector) GetRunning() *int32 {
 	return &b.running
 }
-
-
 
 // SetConnLimiter устанавливает канал для ограничения количества соединений.
 func (b *BaseCollector) SetConnLimiter(ch chan struct{}) {
